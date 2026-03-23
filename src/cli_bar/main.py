@@ -25,7 +25,7 @@ def _read_language_from_profile() -> str:
     routing is established.
     """
     try:
-        from ..io.history_store import get_data_dir
+        from bar_scheduler.io.history_store import get_data_dir
         profile_path = get_data_dir() / "profile.json"
         if profile_path.exists():
             with open(profile_path, encoding="utf-8") as fh:
