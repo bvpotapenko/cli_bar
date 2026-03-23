@@ -1,36 +1,33 @@
 """
-CLI entry point — thin assembler.
+CLI entry point -- thin assembler.
 
 Imports all command modules (which registers their commands on `app`),
 then attaches the interactive main-menu callback.
 """
 
-import json
 import typer
 
+import cli_bar.app as _app_module
+
 from . import views
-from .app import ExerciseOption, LangOption, app
-from .commands import analysis, planning, profile, sessions  # noqa: F401 — side-effect: registers commands
+from .app import ExerciseOption, HistoryPathOption, LangOption, app, effective_data_dir
+from .commands import (
+    analysis,
+    planning,
+    profile,
+    sessions,
+)
+
 app.add_typer(profile.profile_app)
-from bar_scheduler.core.exercises.registry import get_exercise
-from bar_scheduler.core.i18n import available_languages, set_language, t
+from bar_scheduler.api.api import get_exercise_info, get_profile
+from cli_bar.i18n import available_languages, set_language, t
 
 
 def _read_language_from_profile() -> str:
-    """
-    Read the language setting from profile.json without going through HistoryStore.
-
-    Returns "en" on any failure (missing file, parse error, no language key).
-    Intentionally lightweight: called early in main_callback before exercise
-    routing is established.
-    """
+    """Read the language setting from profile. Returns 'en' on any failure."""
     try:
-        from bar_scheduler.io.history_store import get_data_dir
-        profile_path = get_data_dir() / "profile.json"
-        if profile_path.exists():
-            with open(profile_path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            return str(data.get("language", "en"))
+        profile_dict = get_profile(effective_data_dir())
+        return str(profile_dict.get("language", "en"))
     except Exception:
         pass
     return "en"
@@ -41,6 +38,7 @@ def main_callback(
     ctx: typer.Context,
     exercise_id: ExerciseOption = "pull_up",
     lang: LangOption = None,
+    history_path: HistoryPathOption = None,
 ) -> None:
     """
     Strength training planner. Run without a command for interactive mode.
@@ -53,18 +51,22 @@ def main_callback(
       bar-scheduler --lang ru     Russian interface
       bar-scheduler --lang zh     Chinese interface
     """
-    # ── Resolve language: --lang > profile.json > "en" ───────────────────────
+    # -- Apply data directory override (must be first, before any API calls) --
+    if history_path is not None:
+        _app_module._data_dir_override = history_path
+
+    # -- Resolve language: --lang > profile.json > "en" -----------------------
     # Must happen before any output (including the early-return path for subcommands)
     resolved_lang = lang if lang else _read_language_from_profile()
     set_language(resolved_lang)
 
     if ctx.invoked_subcommand is not None:
-        return  # A sub-command was given — let it handle things
+        return  # A sub-command was given -- let it handle things
 
-    # ── Interactive main menu ─────────────────────────────────────────────────
+    # -- Interactive main menu -------------------------------------------------
     views.console.print()
     try:
-        ex_name = get_exercise(exercise_id).display_name
+        ex_name = get_exercise_info(exercise_id)["display_name"]
         header = t("app.tagline_exercise", exercise_name=ex_name)
     except Exception:
         header = t("app.tagline")
@@ -73,23 +75,23 @@ def main_callback(
 
     langs = available_languages()
     menu = {
-        "1": ("plan",             t("menu.show_plan")),
-        "2": ("log-session",      t("menu.log_session")),
-        "3": ("show-history",     t("menu.show_history")),
-        "4": ("plot-max",         t("menu.plot_max")),
-        "5": ("status",           t("menu.status")),
-        "6": ("update-weight",    t("menu.update_weight")),
-        "7": ("volume",           t("menu.volume")),
-        "e": ("explain",          t("menu.explain")),
-        "r": ("1rm",              t("menu.onerepmax")),
-        "f": ("refresh-plan",     t("menu.refresh_plan")),
+        "1": ("plan", t("menu.show_plan")),
+        "2": ("log-session", t("menu.log_session")),
+        "3": ("show-history", t("menu.show_history")),
+        "4": ("plot-max", t("menu.plot_max")),
+        "5": ("status", t("menu.status")),
+        "6": ("update-weight", t("menu.update_weight")),
+        "7": ("volume", t("menu.volume")),
+        "e": ("explain", t("menu.explain")),
+        "r": ("1rm", t("menu.onerepmax")),
+        "f": ("refresh-plan", t("menu.refresh_plan")),
         "u": ("update-equipment", t("menu.update_equipment")),
-        "l": ("update-language",  t("menu.update_language")),
-        "i": ("init",             t("menu.init")),
-        "a": ("add-exercise",     t("menu.add_exercise")),
-        "d": ("delete-record",    t("menu.delete_record")),
-        "h": ("help-adaptation",  t("menu.help_adaptation")),
-        "0": ("quit",             t("menu.quit")),
+        "l": ("update-language", t("menu.update_language")),
+        "i": ("init", t("menu.init")),
+        "a": ("add-exercise", t("menu.add_exercise")),
+        "d": ("delete-record", t("menu.delete_record")),
+        "h": ("help-adaptation", t("menu.help_adaptation")),
+        "0": ("quit", t("menu.quit")),
     }
 
     for key, (_, desc) in menu.items():

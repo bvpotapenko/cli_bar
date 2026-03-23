@@ -1,14 +1,24 @@
-"""Shared Typer app object, shared option types, and store utility."""
+"""Shared Typer app object and shared option types."""
 
 from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
 
-from bar_scheduler.io.history_store import HistoryStore, get_default_history_path, get_profile_store
-
 # Overperformance: reps above training max that trigger personal-best detection
 OVERPERFORMANCE_REP_THRESHOLD = 2
+
+# Set by --history-path global flag; None means use library default (~/.bar-scheduler)
+_data_dir_override: Path | None = None
+
+
+def effective_data_dir() -> Path:
+    """Return the active data directory (override if --history-path was given, else default)."""
+    if _data_dir_override is not None:
+        return _data_dir_override
+    from bar_scheduler.api.api import get_data_dir
+    return get_data_dir()
+
 
 # Shared --exercise option type used across all commands
 ExerciseOption = Annotated[
@@ -22,16 +32,18 @@ LangOption = Annotated[
     typer.Option("--lang", "-l", help="Language override (en, ru, zh). Overrides profile setting."),
 ]
 
+# Shared --history-path option type: optional data directory override
+HistoryPathOption = Annotated[
+    Optional[Path],
+    typer.Option(
+        "--history-path", "-p",
+        help="Override data directory (default: ~/.bar-scheduler). Use for alternative profiles or safe testing.",
+    ),
+]
+
 app = typer.Typer(
     name="bar-scheduler",
     help="Evidence-informed strength training planner.",
     no_args_is_help=False,
     invoke_without_command=True,
 )
-
-
-def get_store(history_path: Path | None, exercise_id: str = "pull_up") -> HistoryStore:
-    """Get history store from path or default location for the given exercise."""
-    if history_path is None:
-        history_path = get_default_history_path(exercise_id)
-    return HistoryStore(history_path, exercise_id=exercise_id)

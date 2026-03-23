@@ -9,26 +9,26 @@ from datetime import datetime
 from rich.console import Console
 from rich.table import Table
 
-from bar_scheduler.core.adaptation import get_training_status
-from bar_scheduler.core.i18n import t
-from cli_bar.ascii_plot import create_max_reps_plot, create_weekly_volume_chart
-from bar_scheduler.core.equipment import bss_is_degraded, check_band_progression, compute_leff, get_assistance_kg, get_catalog, get_next_band_step
-from bar_scheduler.core.exercises.registry import get_exercise
-from bar_scheduler.core.metrics import session_avg_rest, session_max_reps, session_total_reps
-from bar_scheduler.core.models import EquipmentState, ExerciseTarget, SessionPlan, SessionResult, TrainingStatus, UserState
-from bar_scheduler.core.timeline import TimelineEntry, TimelineStatus, build_timeline  # noqa: F401 (re-exported)
+from bar_scheduler.api.api import (
+    get_exercise_info,
+    get_equipment_catalog,
+    get_assistance_kg,
+    compute_leff,
+)
+from cli_bar.ascii_plot import (
+    create_max_reps_plot,
+    create_weekly_volume_chart_from_dict,
+)
+from cli_bar.i18n import t
 
 
 console = Console()
 
 
-def _fmt_prescribed_sets(sets: list, session_type: str) -> str:
-    """
-    Format a list of sets (PlannedSet or SetResult) as a compact string.
-
-    Works with any object that has .target_reps, .added_weight_kg,
-    .rest_seconds_before attributes.
-    """
+def _fmt_prescribed_from_dict(
+    sets: list[dict], session_type: str, exercise_id: str = ""
+) -> str:
+    """Format prescribed sets (API dicts with reps/weight_kg/rest_s) as a compact string."""
     if not sets:
         return "(no sets)"
     if session_type == "TEST":
@@ -36,9 +36,9 @@ def _fmt_prescribed_sets(sets: list, session_type: str) -> str:
 
     from collections import Counter
 
-    reps_list = [s.target_reps for s in sets]
-    weight = sets[0].added_weight_kg
-    rest = sets[0].rest_seconds_before
+    reps_list = [s["reps"] for s in sets]
+    weight = sets[0]["weight_kg"]
+    rest = sets[0]["rest_s"]
 
     if all(r == reps_list[0] for r in reps_list):
         base = f"{reps_list[0]}x{len(reps_list)}"
@@ -51,109 +51,122 @@ def _fmt_prescribed_sets(sets: list, session_type: str) -> str:
         base = ", ".join(parts_out)
 
     weight_str = f" +{weight:.1f}kg" if weight > 0 else ""
-    return f"{base}{weight_str} / {rest}s"
-
-
-def _fmt_prescribed(plan: SessionPlan) -> str:
-    """Format a planned session as a compact single-line string."""
-    text = _fmt_prescribed_sets(plan.sets, plan.session_type)
-    if plan.exercise_id == "bss":
+    text = f"{base}{weight_str} / {rest}s"
+    if exercise_id == "bss":
         text += " (per leg)"
     return text
 
 
-def _fmt_actual(session: SessionResult) -> str:
-    """Format a completed session as a short string including rest times."""
-    sets = [s for s in session.completed_sets if s.actual_reps is not None]
-    if not sets:
-        return "—"
-    if session.session_type == "TEST":
-        max_r = max(s.actual_reps for s in sets)
+def _fmt_actual_from_dict(sets: list[dict], session_type: str) -> str:
+    """Format completed sets (API dicts with reps/weight_kg/rest_s) as a short string."""
+    valid = [s for s in sets if s.get("reps") is not None]
+    if not valid:
+        return "--"
+    if session_type == "TEST":
+        max_r = max(s["reps"] for s in valid)
         return f"{max_r} reps (max)"
 
-    total = sum(s.actual_reps for s in sets)
-    reps_str = "+".join(str(s.actual_reps) for s in sets)
+    total = sum(s["reps"] for s in valid)
+    reps_str = "+".join(str(s["reps"]) for s in valid)
 
-    weights = [s.added_weight_kg for s in sets]
+    weights = [s["weight_kg"] for s in valid]
     weight_str = f" +{weights[0]:.1f}kg" if weights[0] > 0 else ""
 
-    # Inter-set rests (rest_seconds_before for sets 2+; include set 1 too)
-    rests = [s.rest_seconds_before for s in sets]
+    rests = [s["rest_s"] for s in valid]
     if all(r == rests[0] for r in rests):
         rest_str = f"{rests[0]}s"
     else:
         rest_str = ",".join(str(r) for r in rests) + "s"
 
-    rirs = [s.rir_reported for s in sets if s.rir_reported is not None]
-    rir_str = f" RIR≈{round(sum(rirs)/len(rirs))}" if rirs else ""
-
-    return f"{reps_str} = {total}{weight_str} / {rest_str}{rir_str}"
+    return f"{reps_str} = {total}{weight_str} / {rest_str}"
 
 
 _GRIP_ABBR: dict[str, str] = {
     # pull-up variants
-    "pronated": "Pro", "neutral": "Neu", "supinated": "Sup",
+    "pronated": "Pro",
+    "neutral": "Neu",
+    "supinated": "Sup",
     # dip variants
-    "standard": "Std", "chest_lean": "CL ", "tricep_upright": "TUp",
+    "standard": "Std",
+    "chest_lean": "CL ",
+    "tricep_upright": "TUp",
     # bss variants
-    "deficit": "Def", "front_foot_elevated": "FFE",
+    "deficit": "Def",
+    "front_foot_elevated": "FFE",
 }
 _TYPE_DISPLAY: dict[str, str] = {
-    "TEST": "TST", "S": "Str", "H": "Hpy", "E": "End", "T": "Tec",
+    "TEST": "TST",
+    "S": "Str",
+    "H": "Hpy",
+    "E": "End",
+    "T": "Tec",
 }
 
 
-def _fmt_date_cell(date_str: str, status: TimelineStatus) -> str:
+def _fmt_date_cell(date_str: str, status: str) -> str:
     """Format status icon + date as a single compact cell: '> 02.18(Tue)'."""
     dt = datetime.strptime(date_str, "%Y-%m-%d")
     date_part = dt.strftime("%m.%d(%a)")
-    icon = {"done": "✓", "missed": "—", "next": ">", "planned": " ", "extra": "·"}[status]
+    icon = {"done": "✓", "missed": "--", "next": ">", "planned": " ", "extra": "·"}[
+        status
+    ]
     return f"{icon} {date_part}"
 
 
-def _print_equipment_header(exercise, equipment_state: EquipmentState, bodyweight_kg: float | None, exercise_id: str) -> None:
+def _print_equipment_header(
+    exercise: dict,
+    equipment_state: dict,
+    bodyweight_kg: float | None,
+    exercise_id: str,
+) -> None:
     """Print the equipment info line (and optional BSS-degraded warning)."""
-    catalog = get_catalog(exercise_id)
-    item_label = catalog.get(equipment_state.active_item, {}).get("label", equipment_state.active_item)
+    catalog = get_equipment_catalog(exercise_id)
+    active_item = equipment_state["active_item"]
+    item_label = catalog.get(active_item, {}).get("label", active_item)
     a_kg = get_assistance_kg(
-        equipment_state.active_item, exercise_id, equipment_state.machine_assistance_kg
+        exercise_id, active_item, equipment_state.get("machine_assistance_kg")
     )
     if bodyweight_kg and bodyweight_kg > 0:
-        leff = compute_leff(exercise.bw_fraction, bodyweight_kg, 0.0, a_kg)
-        console.print(t("equipment.status_leff", item=item_label, leff=leff, bw=bodyweight_kg))
+        leff = compute_leff(exercise["bw_fraction"], bodyweight_kg, 0.0, a_kg)
+        console.print(
+            t("equipment.status_leff", item=item_label, leff=leff, bw=bodyweight_kg)
+        )
     else:
         console.print(t("equipment.status_item", item=item_label))
-    if exercise_id == "bss" and bss_is_degraded(equipment_state):
+    if exercise_id == "bss" and "ELEVATION_SURFACE" not in (
+        equipment_state.get("available_items") or []
+    ):
         console.print(t("equipment.bss_degraded"))
 
 
 def _emax_cell(
-    entry: "TimelineEntry",
+    entry: dict,
     floor_max: int,
     last_tm: int | None,
 ) -> tuple[str, int | None]:
     """
-    Compute the eMax cell value for a timeline entry.
+    Compute the eMax cell value for a timeline entry dict.
 
-    Returns (cell_str, updated_last_tm) — last_tm is used to suppress
+    Returns (cell_str, updated_last_tm) -- last_tm is used to suppress
     identical consecutive TM projections in the future portion of the plan.
     """
-    if entry.actual is not None:
-        if entry.actual.session_type == "TEST":
+    actual_sets = entry.get("actual_sets")
+    if actual_sets is not None:
+        if entry["type"] == "TEST":
             test_max = max(
-                (s.actual_reps for s in entry.actual.completed_sets if s.actual_reps is not None),
+                (s["reps"] for s in actual_sets if s.get("reps") is not None),
                 default=None,
             )
             return (str(test_max) if test_max is not None else "", last_tm)
-        elif entry.track_b is not None:
-            fi_v = entry.track_b["fi_est"]
-            nz_v = entry.track_b["nuzzo_est"]
+        elif entry.get("track_b") is not None:
+            fi_v = entry["track_b"]["fi_est"]
+            nz_v = entry["track_b"]["nuzzo_est"]
             return (f"{fi_v}/{nz_v}", last_tm)
         else:
             return ("", last_tm)
     else:
-        # Future planned session — project from TM
-        tm_val = entry.planned.expected_tm if entry.planned else None
+        # Future planned session -- project from TM
+        tm_val = entry.get("expected_tm")
         if tm_val is not None:
             emax_val = max(round(tm_val / 0.90), floor_max)
             cell = str(emax_val) if emax_val != last_tm else ""
@@ -161,58 +174,76 @@ def _emax_cell(
         return ("", last_tm)
 
 
-def _grip_legend_str(entries: "list[TimelineEntry]", show_grip: bool) -> str:
+def _grip_legend_str(entries: list[dict], show_grip: bool) -> str:
     """Return the grip abbreviation legend string (empty string when no grip column)."""
     if not show_grip:
         return ""
     grips_seen: set[str] = set()
     for e in entries:
-        if e.actual:
-            grips_seen.add(e.actual.grip)
-        elif e.planned:
-            grips_seen.add(e.planned.grip)
+        if g := e.get("grip"):
+            grips_seen.add(g)
 
     _GRIP_FULL: dict[str, str] = {
-        "pronated": "Pronated", "neutral": "Neutral", "supinated": "Supinated",
-        "standard": "Standard", "chest_lean": "Chest-lean", "tricep_upright": "Tricep-upright",
-        "deficit": "Deficit", "front_foot_elevated": "Front-foot-elevated",
+        "pronated": "Pronated",
+        "neutral": "Neutral",
+        "supinated": "Supinated",
+        "standard": "Standard",
+        "chest_lean": "Chest-lean",
+        "tricep_upright": "Tricep-upright",
+        "deficit": "Deficit",
+        "front_foot_elevated": "Front-foot-elevated",
     }
     grip_parts = [
         f"{_GRIP_ABBR[g].strip()}={_GRIP_FULL[g]}"
-        for g in ("pronated", "neutral", "supinated", "standard",
-                  "chest_lean", "tricep_upright", "deficit", "front_foot_elevated")
+        for g in (
+            "pronated",
+            "neutral",
+            "supinated",
+            "standard",
+            "chest_lean",
+            "tricep_upright",
+            "deficit",
+            "front_foot_elevated",
+        )
         if g in grips_seen and g in _GRIP_ABBR
     ]
     return ("  |  Grip: " + "  ".join(grip_parts)) if grip_parts else ""
 
 
-def _print_band_progression(exercise_id: str, history: list[SessionResult], equipment_state: EquipmentState) -> None:
-    """Print a band-progression suggestion if the user is ready to step up."""
-    if equipment_state.active_item not in ("BAND_HEAVY", "BAND_MEDIUM", "BAND_LIGHT"):
+def _print_band_progression(
+    exercise_id: str, band_hint: str | None, equipment_state: dict | None
+) -> None:
+    """Print a band-progression suggestion if the caller determined one is ready."""
+    if not band_hint or not equipment_state:
         return
     try:
-        ex = get_exercise(exercise_id)
-        if check_band_progression(history, exercise_id, ex.session_params):
-            next_band = get_next_band_step(equipment_state.active_item)
-            if next_band is not None:
-                catalog = get_catalog(exercise_id)
-                current_label = catalog.get(equipment_state.active_item, {}).get("label", equipment_state.active_item)
-                next_label = catalog.get(next_band, {}).get("label", next_band)
-                console.print()
-                console.print(t("equipment.band_progression", current=current_label, next=next_label))
+        catalog = get_equipment_catalog(exercise_id)
+        current_label = catalog.get(equipment_state["active_item"], {}).get(
+            "label", equipment_state["active_item"]
+        )
+        next_label = catalog.get(band_hint, {}).get("label", band_hint)
+        console.print()
+        console.print(
+            t(
+                "equipment.band_progression",
+                current=current_label,
+                next=next_label,
+            )
+        )
     except Exception:
         pass
 
 
 def print_unified_plan(
-    entries: list[TimelineEntry],
-    status: TrainingStatus,
+    entries: list[dict],
+    status: dict,
     exercise_id: str,
     title: str | None = None,
-    exercise_target: ExerciseTarget | None = None,
-    equipment_state: EquipmentState | None = None,
-    history: list[SessionResult] | None = None,
+    exercise_target: dict | None = None,
+    equipment_state: dict | None = None,
+    history: list[dict] | None = None,
     bodyweight_kg: float | None = None,
+    band_hint: str | None = None,
 ) -> None:
     """
     Print the full unified timeline: status + single table.
@@ -230,8 +261,8 @@ def print_unified_plan(
     if title is None:
         title = t("table.training_log_title")
 
-    exercise = get_exercise(exercise_id)
-    show_grip = exercise.has_variant_rotation
+    exercise = get_exercise_info(exercise_id)
+    show_grip = exercise["has_variant_rotation"]
 
     # Header
     console.print()
@@ -248,12 +279,12 @@ def print_unified_plan(
 
     table = Table(title=title, show_lines=False)
 
-    table.add_column("#", justify="right", style="dim", width=3)   # history ID
+    table.add_column("#", justify="right", style="dim", width=3)  # history ID
     table.add_column("Wk", justify="right", style="dim", width=3)
     table.add_column("Date", style="cyan", width=14, no_wrap=True)  # ✓ MM.DD(Ddd)
-    table.add_column("Type", style="magenta", width=5)              # Str/Hpy/End/Tec/TST
+    table.add_column("Type", style="magenta", width=5)  # Str/Hpy/End/Tec/TST
     if show_grip:
-        table.add_column("Grip", width=5)                           # Pro/Neu/Sup/…
+        table.add_column("Grip", width=5)  # Pro/Neu/Sup/…
     table.add_column("Prescribed", width=22)
     table.add_column("Actual", width=24)
     table.add_column(
@@ -264,55 +295,47 @@ def print_unified_plan(
     last_tm: int | None = None
 
     for entry in entries:
-        date_cell = _fmt_date_cell(entry.date, entry.status)
+        date_cell = _fmt_date_cell(entry["date"], entry["status"])
 
         # Wk: only show when week number changes
-        wk_val = entry.week_number if entry.week_number > 0 else None
+        wk_val = entry["week"] if entry.get("week", 0) > 0 else None
         wk_str = str(wk_val) if wk_val is not None and wk_val != last_wk else ""
         if wk_val is not None:
             last_wk = wk_val
 
-        # eMax column — (a) past TEST → actual max  (b) past train → fi/nz  (c) future → projection
-        floor_max = status.latest_test_max or 0
+        # eMax column -- (a) past TEST → actual max  (b) past train → fi/nz  (c) future → projection
+        floor_max = status.get("latest_test_max") or 0
         tm_str, last_tm = _emax_cell(entry, floor_max, last_tm)
 
-        id_str = str(entry.actual_id) if entry.actual_id is not None else ""
+        id_str = str(entry["id"]) if entry.get("id") is not None else ""
 
-        # Type and grip: prefer actual if available; abbreviate
-        if entry.actual:
-            raw_type = entry.actual.session_type
-            raw_grip = entry.actual.grip
-        elif entry.planned:
-            raw_type = entry.planned.session_type
-            raw_grip = entry.planned.grip
-        else:
-            raw_type = ""
-            raw_grip = ""
+        raw_type = entry.get("type", "")
+        raw_grip = entry.get("grip", "")
 
         type_str = _TYPE_DISPLAY.get(raw_type, raw_type[:3] if raw_type else "")
-        grip_str = _GRIP_ABBR.get(raw_grip, raw_grip[:3].capitalize() if raw_grip else "")
+        grip_str = _GRIP_ABBR.get(
+            raw_grip, raw_grip[:3].capitalize() if raw_grip else ""
+        )
 
-        # For completed sessions: show the historically stored planned_sets
-        # (frozen at log time) so past prescriptions are immutable across
-        # plan regenerations.  Fall back to the regenerated plan only when
-        # no stored prescription is available (e.g. sessions logged without
-        # a prior plan).
-        if entry.actual and entry.actual.planned_sets:
-            prescribed_str = _fmt_prescribed_sets(
-                entry.actual.planned_sets, entry.actual.session_type
-            )
-        elif entry.planned:
-            prescribed_str = _fmt_prescribed(entry.planned)
-        else:
-            prescribed_str = ""
-        actual_str = _fmt_actual(entry.actual) if entry.actual else ""
+        # prescribed_sets is already resolved by the API (stored prescription
+        # for done sessions, generated plan for future ones).
+        prescribed_str = _fmt_prescribed_from_dict(
+            entry.get("prescribed_sets") or [], raw_type, exercise_id
+        )
+        actual_sets = entry.get("actual_sets")
+        actual_str = (
+            _fmt_actual_from_dict(actual_sets, raw_type)
+            if actual_sets is not None
+            else ""
+        )
 
         # Style for the row
-        if entry.status == "next":
+        entry_status = entry["status"]
+        if entry_status == "next":
             row_style = "bold"
-        elif entry.status == "done":
+        elif entry_status == "done":
             row_style = "dim"
-        elif entry.status == "missed":
+        elif entry_status == "missed":
             row_style = "dim red"
         else:
             row_style = None
@@ -330,16 +353,16 @@ def print_unified_plan(
     console.print(f"[dim]{t('table.prescribed_legend')}[/dim]")
 
     # Band progression suggestion
-    if equipment_state is not None and history is not None:
-        _print_band_progression(exercise_id, history, equipment_state)
+    if band_hint is not None:
+        _print_band_progression(exercise_id, band_hint, equipment_state)
 
 
-def format_session_table(sessions: list[SessionResult]) -> Table:
+def format_session_table(sessions: list[dict]) -> Table:
     """
-    Create a Rich table displaying session history.
+    Create a Rich table displaying session history (API dict format).
 
     Args:
-        sessions: List of sessions to display
+        sessions: List of session dicts from api.get_history()
 
     Returns:
         Rich Table object
@@ -356,16 +379,19 @@ def format_session_table(sessions: list[SessionResult]) -> Table:
     table.add_column("Avg rest(s)", justify="right")
 
     for i, session in enumerate(sessions, 1):
-        max_reps = session_max_reps(session)
-        total = session_total_reps(session)
-        avg_rest = session_avg_rest(session)
+        sets = session.get("completed_sets") or []
+        reps = [s["actual_reps"] for s in sets if s.get("actual_reps") is not None]
+        rests = [s["rest_seconds_before"] for s in sets if s.get("rest_seconds_before")]
+        max_reps = max(reps) if reps else 0
+        total = sum(reps)
+        avg_rest = sum(rests) / len(rests) if rests else 0
 
         table.add_row(
             str(i),
-            session.date,
-            session.session_type,
-            session.grip,
-            f"{session.bodyweight_kg:.1f}",
+            session["date"],
+            session["session_type"],
+            session["grip"],
+            f"{session['bodyweight_kg']:.1f}",
             str(max_reps) if max_reps > 0 else "-",
             str(total),
             f"{avg_rest:.0f}" if avg_rest > 0 else "-",
@@ -375,14 +401,14 @@ def format_session_table(sessions: list[SessionResult]) -> Table:
 
 
 def format_status_display(
-    status: TrainingStatus,
-    exercise_target: ExerciseTarget | None = None,
+    status: dict,
+    exercise_target: dict | None = None,
 ) -> str:
     """
-    Format training status as text block.
+    Format training status dict (from api.get_training_status / api.get_plan) as text block.
 
     Args:
-        status: TrainingStatus to display
+        status: Status dict with training_max, latest_test_max, trend_slope_per_week, etc.
         exercise_target: User's personal goal for this exercise
 
     Returns:
@@ -390,36 +416,36 @@ def format_status_display(
     """
     lines = [t("status.current_status")]
 
-    if status.latest_test_max is not None:
-        lines.append(t("status.cur_max", max_reps=status.latest_test_max))
-        lines.append(t("status.tr_max", tm=status.training_max))
+    if status.get("latest_test_max") is not None:
+        lines.append(t("status.cur_max", max_reps=status["latest_test_max"]))
+        lines.append(t("status.tr_max", tm=status["training_max"]))
     else:
-        lines.append(t("status.tr_max_only", tm=status.training_max))
+        lines.append(t("status.tr_max_only", tm=status["training_max"]))
 
     if exercise_target is not None:
-        lines.append(t("status.my_goal", goal=exercise_target))
+        goal_str = f"{exercise_target['reps']} reps"
+        if exercise_target.get("weight_kg", 0.0) > 0:
+            goal_str += f" @ +{exercise_target['weight_kg']:.1f} kg"
+        lines.append(t("status.my_goal", goal=goal_str))
 
-    ff = status.fitness_fatigue_state
-    z = ff.readiness_z_score()
     lines.extend(
         [
-            t("status.trend", slope=status.trend_slope),
-            t("status.plateau_yes") if status.is_plateau else t("status.plateau_no"),
-            t("status.deload_yes") if status.deload_recommended else t("status.deload_no"),
-            t("status.readiness_z", z=z),
+            t("status.trend", slope=status["trend_slope_per_week"]),
+            t("status.plateau_yes") if status["is_plateau"] else t("status.plateau_no"),
+            (
+                t("status.deload_yes")
+                if status["deload_recommended"]
+                else t("status.deload_no")
+            ),
+            t("status.readiness_z", z=status["readiness_z_score"]),
         ]
     )
 
     return "\n".join(lines)
 
 
-def print_history(sessions: list[SessionResult]) -> None:
-    """
-    Print session history to console.
-
-    Args:
-        sessions: Sessions to display
-    """
+def print_history(sessions: list[dict]) -> None:
+    """Print session history (API dict format) to console."""
     if not sessions:
         console.print("[yellow]No sessions recorded yet.[/yellow]")
         return
@@ -428,47 +454,8 @@ def print_history(sessions: list[SessionResult]) -> None:
     console.print(table)
 
 
-def print_recent_history(sessions: list[SessionResult]) -> None:
-    """
-    Print recent training history in compact form.
-
-    Args:
-        sessions: Recent sessions to display
-    """
-    if not sessions:
-        return
-
-    console.print()
-    console.print("[bold]Recent History[/bold]")
-
-    table = Table(show_header=True, header_style="dim")
-    table.add_column("Date", style="cyan")
-    table.add_column("Type", style="magenta")
-    table.add_column("Grip")
-    table.add_column("Sets", justify="right")
-    table.add_column("Total", justify="right")
-    table.add_column("Max", justify="right", style="bold")
-
-    for session in sessions:
-        max_reps = session_max_reps(session)
-        total = session_total_reps(session)
-        sets_count = len(session.completed_sets)
-
-        table.add_row(
-            session.date,
-            session.session_type,
-            session.grip,
-            str(sets_count),
-            str(total),
-            str(max_reps) if max_reps > 0 else "-",
-        )
-
-    console.print(table)
-    console.print()
-
-
 def print_max_plot(
-    sessions: list[SessionResult],
+    data_points: list[dict],
     trajectory_z: list[tuple[datetime, float]] | None = None,
     trajectory_g: list[tuple[datetime, float]] | None = None,
     trajectory_m: list[tuple[datetime, float]] | None = None,
@@ -482,7 +469,7 @@ def print_max_plot(
     Print ASCII plot of max reps progress.
 
     Args:
-        sessions: Sessions to plot
+        data_points: List of dicts with "date" and "max_reps" from api.get_progress_data()
         trajectory_z: BW reps trajectory (· dots)
         trajectory_g: Goal-weight reps trajectory (× dots)
         trajectory_m: 1RM added kg trajectory (○ dots, independent right axis)
@@ -493,7 +480,7 @@ def print_max_plot(
         traj_types: Set of requested trajectory flags (z/g/m); used for legend labels
     """
     plot = create_max_reps_plot(
-        sessions,
+        data_points,
         trajectory_z=trajectory_z,
         trajectory_g=trajectory_g,
         trajectory_m=trajectory_m,
@@ -506,15 +493,9 @@ def print_max_plot(
     console.print(plot)
 
 
-def print_volume_chart(sessions: list[SessionResult], weeks: int = 4) -> None:
-    """
-    Print weekly volume chart.
-
-    Args:
-        sessions: Sessions to chart
-        weeks: Number of weeks to show
-    """
-    chart = create_weekly_volume_chart(sessions, weeks)
+def print_volume_chart(volume_data: dict) -> None:
+    """Print weekly volume chart from api.get_volume_data() result."""
+    chart = create_weekly_volume_chart_from_dict(volume_data)
     console.print(chart)
 
 

@@ -1,28 +1,43 @@
 """Profile management commands: init, add-exercise, remove-exercise, update-weight, and interactive menu helpers."""
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
 
-from bar_scheduler.core.equipment import (
-    BSS_ELEVATION_HEIGHTS,
-    BAND_PROGRESSION,
-    bss_is_degraded,
-    compute_equipment_adjustment,
-    compute_leff,
+from bar_scheduler.api.api import (
+    ProfileAlreadyExistsError,
+    ProfileNotFoundError,
+    HistoryNotFoundError,
+    disable_exercise,
+    enable_exercise,
+    get_profile,
+    init_profile,
+    list_exercises,
+    log_session as api_log_session,
+    get_history as api_get_history,
+    set_exercise_days,
+    set_exercise_target,
+    update_bodyweight as api_update_bodyweight,
+    update_language as api_update_language,
+    update_profile,
+    get_exercise_info,
+    training_max_from_baseline,
+    get_equipment_catalog,
     get_assistance_kg,
-    get_catalog,
-    snapshot_from_state,
+    compute_leff,
+    compute_equipment_adjustment,
+    get_bss_elevation_heights,
+    get_current_equipment,
+    set_plan_start_date,
+    delete_exercise_history,
+    update_equipment,
 )
-from bar_scheduler.core.exercises.registry import EXERCISE_REGISTRY, get_exercise
-from bar_scheduler.core.metrics import training_max_from_baseline
-from bar_scheduler.core.models import EquipmentState, ExerciseTarget, SessionResult, SetResult, UserProfile
 from cli_bar import views
-from cli_bar.app import ExerciseOption, app, get_store
-from bar_scheduler.core.i18n import available_languages, t
-from bar_scheduler.io.history_store import get_profile_store
+from cli_bar.app import ExerciseOption, app, effective_data_dir
+from cli_bar.i18n import available_languages, t
 
 profile_app = typer.Typer(
     name="profile",
@@ -47,7 +62,9 @@ def init(
     ],
     days_per_week: Annotated[
         int,
-        typer.Option("--days-per-week", "-d", help="Global default training days per week (1–5)"),
+        typer.Option(
+            "--days-per-week", "-d", help="Global default training days per week (1–5)"
+        ),
     ] = 3,
     force: Annotated[
         bool,
@@ -60,8 +77,6 @@ def init(
     Sets height, sex, global training days per week, and bodyweight.
     Does not set up any exercise. Use 'profile add-exercise <id>' to add an exercise.
     """
-    store = get_profile_store()
-
     # Validate inputs
     if sex not in ("male", "female"):
         views.print_error(t("error.sex_must_be"))
@@ -75,52 +90,34 @@ def init(
         views.print_error(t("error.bodyweight_positive"))
         raise typer.Exit(1)
 
-    old_profile = store.load_profile()
-    old_bw = store.load_bodyweight()
-
-    if old_profile is not None and not force:
-        views.print_warning(t("profile.already_exists"))
-        views.console.print(t("profile.use_force_to_overwrite"))
-
-    profile = UserProfile(
-        height_cm=height_cm,
-        sex=sex,  # type: ignore
-        preferred_days_per_week=days_per_week,
-        exercise_days=dict(old_profile.exercise_days) if old_profile is not None else {},
-        exercise_targets=dict(old_profile.exercise_targets) if old_profile is not None else {},
-        exercises_enabled=list(old_profile.exercises_enabled) if old_profile is not None else [],
-        max_session_duration_minutes=(
-            old_profile.max_session_duration_minutes if old_profile is not None else 60
-        ),
-        rest_preference=(
-            old_profile.rest_preference if old_profile is not None else "normal"
-        ),
-        injury_notes=(
-            old_profile.injury_notes if old_profile is not None else ""
-        ),
-        language=(
-            old_profile.language if old_profile is not None else "en"
-        ),
-    )
-
-    store.history_path.parent.mkdir(parents=True, exist_ok=True)
-    store.save_profile(profile, bodyweight_kg)
-
-    if old_profile is not None:
-        views.console.print()
-        views.console.print(t("profile.changes_title"))
-
-        def _chg(label: str, old: object, new: object) -> None:
-            marker = " [green](changed)[/green]" if old != new else ""
-            views.console.print(f"  {label}: {old} → {new}{marker}")
-
-        _chg("Height", f"{old_profile.height_cm} cm", f"{height_cm} cm")
-        _chg("Sex", old_profile.sex, sex)
-        _chg("Days/week (global)", old_profile.preferred_days_per_week, days_per_week)
-        old_bw_str = f"{old_bw:.1f} kg" if old_bw is not None else "?"
-        _chg("Bodyweight", old_bw_str, f"{bodyweight_kg:.1f} kg")
-    else:
-        views.print_success(t("profile.initialized", path=store.profile_path))
+    try:
+        init_profile(
+            effective_data_dir(),
+            height_cm=height_cm,
+            sex=sex,
+            bodyweight_kg=bodyweight_kg,
+            exercises=[],
+            days_per_week=days_per_week,
+        )
+        views.print_success(
+            t("profile.initialized", path=effective_data_dir() / "profile.json")
+        )
+    except ProfileAlreadyExistsError:
+        if not force:
+            views.print_warning(t("profile.already_exists"))
+            views.console.print(t("profile.use_force_to_overwrite"))
+            raise typer.Exit(0)
+        update_profile(
+            effective_data_dir(),
+            height_cm=height_cm,
+            sex=sex,
+            preferred_days_per_week=days_per_week,
+        )
+        api_update_bodyweight(effective_data_dir(), bodyweight_kg)
+        views.print_success(t("profile.updated", path=effective_data_dir() / "profile.json"))
+    except ValueError as e:
+        views.print_error(str(e))
+        raise typer.Exit(1)
 
 
 @profile_app.command("add-exercise")
@@ -131,7 +128,11 @@ def add_exercise(
     ],
     days_per_week: Annotated[
         int,
-        typer.Option("--days-per-week", "-d", help="Training days per week for this exercise (1–5)"),
+        typer.Option(
+            "--days-per-week",
+            "-d",
+            help="Training days per week for this exercise (1–5)",
+        ),
     ] = 3,
     target_reps: Annotated[
         int,
@@ -143,11 +144,17 @@ def add_exercise(
     ] = 0.0,
     baseline_max: Annotated[
         Optional[int],
-        typer.Option("--baseline-max", "-b", help="Baseline max reps (logs a TEST session)"),
+        typer.Option(
+            "--baseline-max", "-b", help="Baseline max reps (logs a TEST session)"
+        ),
     ] = None,
     force: Annotated[
         bool,
-        typer.Option("--force", "-f", help="Re-initialise from scratch if exercise already enabled"),
+        typer.Option(
+            "--force",
+            "-f",
+            help="Re-initialise from scratch if exercise already enabled",
+        ),
     ] = False,
 ) -> None:
     """
@@ -157,9 +164,9 @@ def add_exercise(
     """
     # Validate exercise_id
     try:
-        exercise = get_exercise(exercise_id)
-    except ValueError:
-        valid = ", ".join(EXERCISE_REGISTRY.keys())
+        exercise = get_exercise_info(exercise_id)
+    except (ValueError, KeyError):
+        valid = ", ".join(ex["id"] for ex in list_exercises())
         views.print_error(f"Unknown exercise '{exercise_id}'. Valid: {valid}")
         raise typer.Exit(1)
 
@@ -175,91 +182,84 @@ def add_exercise(
         views.print_error(t("error.positive_number"))
         raise typer.Exit(1)
 
-    profile_store = get_profile_store()
-    profile = profile_store.load_profile()
-    if profile is None:
-        views.print_error(t("error.profile_not_found", path=profile_store.profile_path))
+    profile_dict = get_profile(effective_data_dir())
+    if profile_dict is None:
+        views.print_error(
+            t("error.profile_not_found", path=effective_data_dir() / "profile.json")
+        )
         views.print_info("Run 'profile init' first to create your profile.")
         raise typer.Exit(1)
 
-    if exercise_id in profile.exercises_enabled and not force:
+    if exercise_id in profile_dict.get("exercises_enabled", []) and not force:
         views.print_error(
             f"Exercise '{exercise_id}' is already enabled. "
             "Use --force to wipe and re-add it."
         )
         raise typer.Exit(1)
 
-    exercise_store = get_store(None, exercise_id)
+    if force and exercise_id in profile_dict.get("exercises_enabled", []):
+        disable_exercise(effective_data_dir(), exercise_id)
+        _wipe_exercise_equipment(effective_data_dir(), exercise_id)
+        _wipe_exercise_plan_start(effective_data_dir(), exercise_id)
+        delete_exercise_history(effective_data_dir(), exercise_id)
 
-    if force and exercise_id in profile.exercises_enabled:
-        # Wipe exercise-specific data
-        profile.exercises_enabled.remove(exercise_id)
-        profile.exercise_days.pop(exercise_id, None)
-        profile.exercise_targets.pop(exercise_id, None)
-        # Remove equipment entries for this exercise
-        _wipe_exercise_equipment(profile_store, exercise_id)
-        # Remove plan_start_date entry
-        _wipe_exercise_plan_start(profile_store, exercise_id)
-        # Delete history file if it exists
-        if exercise_store.history_path.exists():
-            exercise_store.history_path.unlink()
+    enable_exercise(effective_data_dir(), exercise_id)
+    set_exercise_target(effective_data_dir(), exercise_id, target_reps, target_weight)
+    set_exercise_days(effective_data_dir(), exercise_id, days_per_week)
 
-    # Add exercise to profile
-    profile.exercises_enabled.append(exercise_id)
-    profile.exercise_days[exercise_id] = days_per_week
-    profile.exercise_targets[exercise_id] = ExerciseTarget(reps=target_reps, weight_kg=target_weight)
-
-    # Save updated profile
-    bw = profile_store.load_bodyweight() or 80.0
-    profile_store.save_profile(profile, bw)
-
-    # Create history file
-    exercise_store.init()
+    bw = profile_dict.get("current_bodyweight_kg", 80.0)
 
     # Set plan start date (2 days from today)
     today = datetime.now()
     plan_start = (today + timedelta(days=2)).strftime("%Y-%m-%d")
-    exercise_store.set_plan_start_date(plan_start)
+    set_plan_start_date(effective_data_dir(), exercise_id, plan_start)
 
     # Equipment setup (interactive)
     views.console.print()
     views.console.print(f"[bold]{t('profile.equipment_setup_title')}[/bold]")
-    existing_eq = exercise_store.load_current_equipment(exercise_id)
-    new_eq_state = _ask_equipment(exercise_id, existing_eq)
-    exercise_store.update_equipment(new_eq_state)
+    existing_eq = get_current_equipment(effective_data_dir(), exercise_id)
+    new_eq = _ask_equipment(exercise_id, existing_eq)
+    update_equipment(
+        effective_data_dir(),
+        exercise_id,
+        active_item=new_eq["active_item"],
+        available_items=new_eq["available_items"],
+        machine_assistance_kg=new_eq.get("machine_assistance_kg"),
+        elevation_height_cm=new_eq.get("elevation_height_cm"),
+    )
 
     # Log baseline TEST session if provided
     if baseline_max is not None:
         today_str = today.strftime("%Y-%m-%d")
-        primary_grip = exercise.primary_variant
-        test_set = SetResult(
-            target_reps=baseline_max,
-            actual_reps=baseline_max,
-            rest_seconds_before=180,
-            added_weight_kg=0.0,
-            rir_target=0,
-            rir_reported=0,
+        api_log_session(
+            effective_data_dir(),
+            exercise_id,
+            {
+                "date": today_str,
+                "bodyweight_kg": bw,
+                "grip": exercise["primary_variant"],
+                "session_type": "TEST",
+                "exercise_id": exercise_id,
+                "planned_sets": [{"target_reps": baseline_max}],
+                "completed_sets": [
+                    {
+                        "actual_reps": baseline_max,
+                        "rest_seconds_before": 180,
+                        "added_weight_kg": 0.0,
+                        "rir_reported": 0,
+                    }
+                ],
+                "notes": "Baseline max test",
+            },
         )
-        session = SessionResult(
-            date=today_str,
-            bodyweight_kg=bw,
-            grip=primary_grip,
-            session_type="TEST",
-            exercise_id=exercise_id,
-            planned_sets=[test_set],
-            completed_sets=[test_set],
-            notes="Baseline max test",
-        )
-        exercise_store.append_session(session)
         views.print_success(t("profile.logged_baseline", reps=baseline_max))
         tm = training_max_from_baseline(baseline_max)
         views.print_info(t("profile.training_max", tm=tm))
 
     views.print_success(
-        f"Exercise '{exercise.display_name}' added. "
+        f"Exercise '{exercise['display_name']}' added. "
         f"Target: {target_reps} reps, {days_per_week} days/week."
     )
-    views.print_info(f"History file: {exercise_store.history_path}")
 
 
 @profile_app.command("remove-exercise")
@@ -279,59 +279,45 @@ def remove_exercise(
     Removes from exercises_enabled, clears exercise-specific targets/days/equipment.
     Use --delete-history to also delete the history file.
     """
-    profile_store = get_profile_store()
-    profile = profile_store.load_profile()
-    if profile is None:
-        views.print_error(t("error.profile_not_found", path=profile_store.profile_path))
-        raise typer.Exit(1)
-
-    if exercise_id not in profile.exercises_enabled:
+    profile_dict = get_profile(effective_data_dir())
+    if profile_dict is None or exercise_id not in profile_dict.get(
+        "exercises_enabled", []
+    ):
         views.print_error(f"Exercise '{exercise_id}' is not in your enabled exercises.")
         raise typer.Exit(1)
 
-    profile.exercises_enabled.remove(exercise_id)
-    profile.exercise_days.pop(exercise_id, None)
-    profile.exercise_targets.pop(exercise_id, None)
-    _wipe_exercise_equipment(profile_store, exercise_id)
-    _wipe_exercise_plan_start(profile_store, exercise_id)
-
-    bw = profile_store.load_bodyweight() or 80.0
-    profile_store.save_profile(profile, bw)
+    disable_exercise(effective_data_dir(), exercise_id)
+    _wipe_exercise_equipment(effective_data_dir(), exercise_id)
+    _wipe_exercise_plan_start(effective_data_dir(), exercise_id)
 
     if delete_history:
-        exercise_store = get_store(None, exercise_id)
-        if exercise_store.history_path.exists():
-            exercise_store.history_path.unlink()
-            views.print_info(f"Deleted history file: {exercise_store.history_path}")
+        delete_exercise_history(effective_data_dir(), exercise_id)
+        views.print_info(f"Deleted history for '{exercise_id}'.")
 
     views.print_success(f"Exercise '{exercise_id}' removed from profile.")
 
 
-def _wipe_exercise_equipment(store, exercise_id: str) -> None:
+def _wipe_exercise_equipment(data_dir: Path, exercise_id: str) -> None:
     """Remove all equipment entries for exercise_id from profile.json."""
-    import json
-    if not store.profile_path.exists():
+    profile_path = data_dir / "profile.json"
+    if not profile_path.exists():
         return
-    with open(store.profile_path, "r") as f:
+    with open(profile_path, "r") as f:
         data = json.load(f)
-    equipment = data.get("equipment", {})
-    equipment.pop(exercise_id, None)
-    data["equipment"] = equipment
-    with open(store.profile_path, "w") as f:
+    data.get("equipment", {}).pop(exercise_id, None)
+    with open(profile_path, "w") as f:
         json.dump(data, f, indent=2)
 
 
-def _wipe_exercise_plan_start(store, exercise_id: str) -> None:
+def _wipe_exercise_plan_start(data_dir: Path, exercise_id: str) -> None:
     """Remove the plan_start_date entry for exercise_id from profile.json."""
-    import json
-    if not store.profile_path.exists():
+    profile_path = data_dir / "profile.json"
+    if not profile_path.exists():
         return
-    with open(store.profile_path, "r") as f:
+    with open(profile_path, "r") as f:
         data = json.load(f)
-    plan_starts = data.get("plan_start_dates", {})
-    plan_starts.pop(exercise_id, None)
-    data["plan_start_dates"] = plan_starts
-    with open(store.profile_path, "w") as f:
+    data.get("plan_start_dates", {}).pop(exercise_id, None)
+    with open(profile_path, "w") as f:
         json.dump(data, f, indent=2)
 
 
@@ -345,68 +331,89 @@ def update_weight(
     """
     Update current bodyweight in profile.
     """
-    store = get_profile_store()
-
-    if not store.profile_path.exists():
-        views.print_error(t("error.profile_not_found", path=store.profile_path))
-        views.print_info(t("error.run_init_profile"))
-        raise typer.Exit(1)
-
     if bodyweight_kg <= 0:
         views.print_error(t("error.bodyweight_positive"))
         raise typer.Exit(1)
 
     try:
-        store.update_bodyweight(bodyweight_kg)
-    except FileNotFoundError as e:
+        api_update_bodyweight(effective_data_dir(), bodyweight_kg)
+        views.print_success(t("profile.updated_bodyweight", value=bodyweight_kg))
+    except ProfileNotFoundError:
+        views.print_error(
+            t("error.profile_not_found", path=effective_data_dir() / "profile.json")
+        )
+        views.print_info(t("error.run_init_profile"))
+        raise typer.Exit(1)
+    except ValueError as e:
         views.print_error(str(e))
         raise typer.Exit(1)
 
-    views.print_success(t("profile.updated_bodyweight", value=bodyweight_kg))
-
 
 def _menu_update_equipment(exercise_id: str) -> None:
-    """Interactive equipment update helper — called from the menu and CLI command."""
-    store = get_profile_store()
-    if not store.profile_path.exists():
-        views.print_error(t("error.profile_not_found", path=store.profile_path))
+    """Interactive equipment update helper -- called from the menu and CLI command."""
+    profile_dict = get_profile(effective_data_dir())
+    if profile_dict is None:
+        views.print_error(
+            t("error.profile_not_found", path=effective_data_dir() / "profile.json")
+        )
         views.print_info(t("error.run_init_profile"))
         return
 
-    existing = store.load_current_equipment(exercise_id)
-    exercise = get_exercise(exercise_id)
+    existing = get_current_equipment(effective_data_dir(), exercise_id)
+    exercise = get_exercise_info(exercise_id)
 
     if existing is not None:
         views.console.print()
-        a_kg = get_assistance_kg(existing.active_item, exercise_id, existing.machine_assistance_kg)
-        catalog = get_catalog(exercise_id)
-        item_label = catalog.get(existing.active_item, {}).get("label", existing.active_item)
-        views.console.print(t("equipment.current_header", exercise_name=exercise.display_name))
+        a_kg = get_assistance_kg(
+            exercise_id, existing["active_item"], existing.get("machine_assistance_kg")
+        )
+        catalog = get_equipment_catalog(exercise_id)
+        item_label = catalog.get(existing["active_item"], {}).get(
+            "label", existing["active_item"]
+        )
+        views.console.print(
+            t("equipment.current_header", exercise_name=exercise["display_name"])
+        )
         views.console.print(t("equipment.active_item", item=item_label))
         if a_kg > 0:
             views.console.print(t("equipment.assistance_kg", kg=a_kg))
-        if existing.elevation_height_cm:
-            views.console.print(t("equipment.elevation_cm", cm=existing.elevation_height_cm))
+        if existing.get("elevation_height_cm"):
+            views.console.print(
+                t("equipment.elevation_cm", cm=existing["elevation_height_cm"])
+            )
 
-    new_state = _ask_equipment(exercise_id, existing)
+    new_eq = _ask_equipment(exercise_id, existing)
 
     # Compute Leff change for adjustment note
     if existing is not None:
-        bw = store.load_bodyweight() or 80.0
-        ex = get_exercise(exercise_id)
-        old_a = get_assistance_kg(existing.active_item, exercise_id, existing.machine_assistance_kg)
-        new_a = get_assistance_kg(new_state.active_item, exercise_id, new_state.machine_assistance_kg)
-        old_leff = compute_leff(ex.bw_fraction, bw, 0.0, old_a)
-        new_leff = compute_leff(ex.bw_fraction, bw, 0.0, new_a)
+        bw = profile_dict.get("current_bodyweight_kg", 80.0)
+        bw_fraction = exercise["bw_fraction"]
+        old_a = get_assistance_kg(
+            exercise_id, existing["active_item"], existing.get("machine_assistance_kg")
+        )
+        new_a = get_assistance_kg(
+            exercise_id, new_eq["active_item"], new_eq.get("machine_assistance_kg")
+        )
+        old_leff = compute_leff(bw_fraction, bw, 0.0, old_a)
+        new_leff = compute_leff(bw_fraction, bw, 0.0, new_a)
 
         adj = compute_equipment_adjustment(old_leff, new_leff)
         if adj["reps_factor"] != 1.0:
             views.console.print()
-            views.print_warning(t("equipment.change_detected", description=adj["description"]))
+            views.print_warning(
+                t("equipment.change_detected", description=adj["description"])
+            )
             views.print_info(t("equipment.change_hint"))
 
-    store.update_equipment(new_state)
-    views.print_success(t("equipment.updated", exercise_name=exercise.display_name))
+    update_equipment(
+        effective_data_dir(),
+        exercise_id,
+        active_item=new_eq["active_item"],
+        available_items=new_eq["available_items"],
+        machine_assistance_kg=new_eq.get("machine_assistance_kg"),
+        elevation_height_cm=new_eq.get("elevation_height_cm"),
+    )
+    views.print_success(t("equipment.updated", exercise_name=exercise["display_name"]))
 
 
 @profile_app.command("update-equipment")
@@ -427,22 +434,23 @@ def update_equipment_cmd(
 
 
 def _detect_active_exercises() -> list[str]:
-    """Return exercise IDs (in registry order) that have non-empty history files."""
-    from bar_scheduler.io.history_store import get_default_history_path
-    from bar_scheduler.core.exercises.registry import EXERCISE_REGISTRY
-
+    """Return exercise IDs that have non-empty history."""
     active = []
-    for ex_id in EXERCISE_REGISTRY:
-        path = get_default_history_path(ex_id)
-        if path.exists() and path.stat().st_size > 0:
-            active.append(ex_id)
+    for ex in list_exercises():
+        try:
+            if api_get_history(effective_data_dir(), ex["id"]):
+                active.append(ex["id"])
+        except HistoryNotFoundError:
+            pass
     return active
 
 
 def _ask_days(label: str, default: int) -> int:
     """Prompt for training days/week (1–5) with a given label and default."""
     while True:
-        raw = views.console.input(t("profile.days_prompt", label=label, default=default)).strip()
+        raw = views.console.input(
+            t("profile.days_prompt", label=label, default=default)
+        ).strip()
         if not raw:
             return default
         try:
@@ -454,7 +462,7 @@ def _ask_days(label: str, default: int) -> int:
         views.print_error(t("error.enter_1_to_5"))
 
 
-def _ask_equipment(exercise_id: str, existing: EquipmentState | None = None) -> EquipmentState:
+def _ask_equipment(exercise_id: str, existing: dict | None = None) -> dict:
     """
     Interactively prompt for equipment setup for one exercise.
 
@@ -462,17 +470,17 @@ def _ask_equipment(exercise_id: str, existing: EquipmentState | None = None) -> 
     for 'available' and single-select for 'active'.  For BSS, shows elevation
     height selection if ELEVATION_SURFACE is chosen.
 
-    Returns a new EquipmentState (valid_from = today, valid_until = None).
+    Returns a dict with keys: active_item, available_items,
+    machine_assistance_kg, elevation_height_cm.
     """
-    from datetime import datetime
-
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    catalog = get_catalog(exercise_id)
-    items = list(catalog.items())   # [(id, info), ...]
-    exercise = get_exercise(exercise_id)
+    catalog = get_equipment_catalog(exercise_id)
+    items = list(catalog.items())  # [(id, info), ...]
+    exercise = get_exercise_info(exercise_id)
 
     views.console.print()
-    views.console.print(f"[bold]{t('equipment.title', exercise_name=exercise.display_name)}[/bold]")
+    views.console.print(
+        f"[bold]{t('equipment.title', exercise_name=exercise['display_name'])}[/bold]"
+    )
     views.console.print(t("equipment.available_hint"))
 
     # Show numbered list
@@ -482,15 +490,19 @@ def _ask_equipment(exercise_id: str, existing: EquipmentState | None = None) -> 
 
     # Default: preserve existing available_items or just the first (base) item
     if existing is not None:
-        default_avail = existing.available_items
+        default_avail = existing["available_items"]
         default_avail_str = ",".join(
-            str(i + 1) for i, (item_id, _) in enumerate(items) if item_id in default_avail
+            str(i + 1)
+            for i, (item_id, _) in enumerate(items)
+            if item_id in default_avail
         )
     else:
         default_avail_str = "1"
 
     while True:
-        raw = views.console.input(t("equipment.available_prompt", default=default_avail_str)).strip()
+        raw = views.console.input(
+            t("equipment.available_prompt", default=default_avail_str)
+        ).strip()
         selection_str = raw if raw else default_avail_str
         try:
             indices = [int(x.strip()) for x in selection_str.split(",")]
@@ -502,7 +514,7 @@ def _ask_equipment(exercise_id: str, existing: EquipmentState | None = None) -> 
         views.print_error(t("equipment.available_error", count=len(items)))
 
     # Select active item from available subset.
-    # Only ask when items have different effective assistance — otherwise the
+    # Only ask when items have different effective assistance -- otherwise the
     # choice has no impact on Leff and prompting is confusing.
     def _effective_assistance(item_id: str) -> object:
         a = catalog[item_id].get("assistance_kg")
@@ -518,13 +530,15 @@ def _ask_equipment(exercise_id: str, existing: EquipmentState | None = None) -> 
             info = catalog[item_id]
             views.console.print(f"  [{i}] {info['label']}")
 
-        if existing is not None and existing.active_item in available_items:
-            default_active_idx = available_items.index(existing.active_item) + 1
+        if existing is not None and existing["active_item"] in available_items:
+            default_active_idx = available_items.index(existing["active_item"]) + 1
         else:
             default_active_idx = 1
 
         while True:
-            raw = views.console.input(t("equipment.active_prompt", default=default_active_idx)).strip()
+            raw = views.console.input(
+                t("equipment.active_prompt", default=default_active_idx)
+            ).strip()
             try:
                 idx = int(raw) if raw else default_active_idx
                 if 1 <= idx <= len(available_items):
@@ -534,18 +548,20 @@ def _ask_equipment(exercise_id: str, existing: EquipmentState | None = None) -> 
                 pass
             views.print_error(t("equipment.active_error", count=len(available_items)))
     else:
-        # All selected items have the same effective load — no prompt needed.
-        if existing is not None and existing.active_item in available_items:
-            active_item = existing.active_item
+        # All selected items have the same effective load -- no prompt needed.
+        if existing is not None and existing["active_item"] in available_items:
+            active_item = existing["active_item"]
         else:
             active_item = available_items[0]
 
     # Machine-assisted: ask for kg
     machine_assistance_kg: float | None = None
     if active_item == "MACHINE_ASSISTED":
-        default_machine = existing.machine_assistance_kg if existing else 40.0
+        default_machine = existing.get("machine_assistance_kg") if existing else 40.0
         while True:
-            raw = views.console.input(t("equipment.machine_kg_prompt", default=default_machine)).strip()
+            raw = views.console.input(
+                t("equipment.machine_kg_prompt", default=default_machine)
+            ).strip()
             try:
                 val = float(raw) if raw else default_machine
                 if val >= 0:
@@ -558,42 +574,48 @@ def _ask_equipment(exercise_id: str, existing: EquipmentState | None = None) -> 
     # BSS elevation height
     elevation_height_cm: int | None = None
     if exercise_id == "bss" and "ELEVATION_SURFACE" in available_items:
-        default_elev = existing.elevation_height_cm if existing and existing.elevation_height_cm else 45
-        heights_str = "/".join(str(h) for h in BSS_ELEVATION_HEIGHTS)
+        heights = get_bss_elevation_heights()
+        default_elev = (
+            existing.get("elevation_height_cm")
+            if existing
+            else (heights[0] if heights else 45)
+        )
+        if not default_elev:
+            default_elev = heights[0] if heights else 45
+        heights_str = "/".join(str(h) for h in heights)
         while True:
             raw = views.console.input(
-                t("equipment.elevation_prompt", options=heights_str, default=default_elev)
+                t(
+                    "equipment.elevation_prompt",
+                    options=heights_str,
+                    default=default_elev,
+                )
             ).strip()
             try:
                 val = int(raw) if raw else default_elev
-                if val in BSS_ELEVATION_HEIGHTS:
+                if val in heights:
                     elevation_height_cm = val
                     break
             except ValueError:
                 pass
             views.print_error(t("equipment.elevation_error", options=heights_str))
 
-    # BSS degraded warning
-    tmp_state = EquipmentState(
-        exercise_id=exercise_id,
-        available_items=available_items,
-        active_item=active_item,
-        machine_assistance_kg=machine_assistance_kg,
-        elevation_height_cm=elevation_height_cm,
-        valid_from=today_str,
-    )
-    if exercise_id == "bss" and bss_is_degraded(tmp_state):
+    # BSS degraded warning (inline: no elevation surface selected)
+    if exercise_id == "bss" and "ELEVATION_SURFACE" not in available_items:
         views.console.print()
         views.print_warning(t("equipment.bss_no_elevation"))
 
-    return tmp_state
+    return {
+        "active_item": active_item,
+        "available_items": available_items,
+        "machine_assistance_kg": machine_assistance_kg,
+        "elevation_height_cm": elevation_height_cm,
+    }
 
 
 def _menu_init() -> None:
     """Interactive profile setup helper (profile basics only) called from the main menu."""
-    store = get_profile_store()
-    old_profile = store.load_profile()
-    old_bw = store.load_bodyweight()
+    profile_dict = get_profile(effective_data_dir())
 
     views.console.print()
     views.console.print(t("profile.setup_title"))
@@ -602,10 +624,13 @@ def _menu_init() -> None:
     views.console.print()
 
     # Height
-    default_h = old_profile.height_cm if old_profile else None
+    default_h = profile_dict.get("height_cm") if profile_dict else None
     while True:
-        prompt = (t("profile.height_prompt", default=default_h) if default_h is not None
-                  else "Height cm: ")
+        prompt = (
+            t("profile.height_prompt", default=default_h)
+            if default_h is not None
+            else "Height cm: "
+        )
         raw = views.console.input(prompt).strip()
         if not raw and default_h is not None:
             height_cm = default_h
@@ -619,10 +644,13 @@ def _menu_init() -> None:
         views.print_error(t("error.positive_integer"))
 
     # Sex
-    default_sex = old_profile.sex if old_profile else None
+    default_sex = profile_dict.get("sex") if profile_dict else None
     while True:
-        prompt = (t("profile.sex_prompt", default=default_sex) if default_sex is not None
-                  else "Sex (male/female): ")
+        prompt = (
+            t("profile.sex_prompt", default=default_sex)
+            if default_sex is not None
+            else "Sex (male/female): "
+        )
         raw = views.console.input(prompt).strip().lower()
         if not raw and default_sex is not None:
             sex = default_sex
@@ -633,14 +661,17 @@ def _menu_init() -> None:
         views.print_error(t("error.sex_invalid"))
 
     # Global days per week (fallback for exercises without per-exercise override)
-    default_days = old_profile.preferred_days_per_week if old_profile else 3
+    default_days = profile_dict.get("preferred_days_per_week", 3) if profile_dict else 3
     global_days = _ask_days("Global training days per week (default)", default_days)
 
     # Bodyweight
-    default_bw = old_bw if old_bw is not None else None
+    default_bw = profile_dict.get("current_bodyweight_kg") if profile_dict else None
     while True:
-        prompt = (t("profile.bodyweight_prompt", default=f"{default_bw:.1f}") if default_bw is not None
-                  else "Bodyweight kg: ")
+        prompt = (
+            t("profile.bodyweight_prompt", default=f"{default_bw:.1f}")
+            if default_bw is not None
+            else "Bodyweight kg: "
+        )
         raw = views.console.input(prompt).strip()
         if not raw and default_bw is not None:
             bodyweight_kg = default_bw
@@ -657,9 +688,19 @@ def _menu_init() -> None:
     langs = available_languages()
     if len(langs) > 1:
         options_str = "/".join(langs)
-        default_lang = old_profile.language if old_profile else "en"
+        default_lang = profile_dict.get("language", "en") if profile_dict else "en"
         while True:
-            raw = views.console.input(t("profile.language_prompt", options=options_str, default=default_lang)).strip().lower()
+            raw = (
+                views.console.input(
+                    t(
+                        "profile.language_prompt",
+                        options=options_str,
+                        default=default_lang,
+                    )
+                )
+                .strip()
+                .lower()
+            )
             if not raw:
                 language = default_lang
                 break
@@ -670,86 +711,81 @@ def _menu_init() -> None:
     else:
         language = "en"
 
-    profile = UserProfile(
-        height_cm=height_cm,
-        sex=sex,  # type: ignore
-        preferred_days_per_week=global_days,
-        exercise_days=dict(old_profile.exercise_days) if old_profile is not None else {},
-        exercise_targets=dict(old_profile.exercise_targets) if old_profile is not None else {},
-        exercises_enabled=list(old_profile.exercises_enabled) if old_profile is not None else [],
-        max_session_duration_minutes=(
-            old_profile.max_session_duration_minutes if old_profile is not None else 60
-        ),
-        rest_preference=(
-            old_profile.rest_preference if old_profile is not None else "normal"
-        ),
-        injury_notes=(
-            old_profile.injury_notes if old_profile is not None else ""
-        ),
-        language=language,
-    )
-    store.history_path.parent.mkdir(parents=True, exist_ok=True)
-    store.save_profile(profile, bodyweight_kg)
-
-    views.console.print()
-    if old_profile is not None:
-        views.console.print(t("profile.changes_title"))
-
-        def _chg(label: str, old: object, new: object) -> None:
-            marker = " [green](changed)[/green]" if old != new else ""
-            views.console.print(f"  {label}: {old} → {new}{marker}")
-
-        _chg("Height", f"{old_profile.height_cm} cm", f"{height_cm} cm")
-        _chg("Sex", old_profile.sex, sex)
-        _chg("Days/week (global)", old_profile.preferred_days_per_week, global_days)
-        old_bw_str = f"{old_bw:.1f} kg" if old_bw is not None else "?"
-        _chg("Bodyweight", old_bw_str, f"{bodyweight_kg:.1f} kg")
+    if profile_dict is None:
+        init_profile(
+            effective_data_dir(),
+            height_cm=height_cm,
+            sex=sex,
+            bodyweight_kg=bodyweight_kg,
+            exercises=[],
+            days_per_week=global_days,
+            language=language,
+        )
+        views.console.print()
+        views.print_success(
+            t("profile.profile_saved", path=effective_data_dir() / "profile.json")
+        )
     else:
-        views.print_success(t("profile.profile_saved", path=store.profile_path))
-    views.console.print("[dim]Use 'profile add-exercise <id>' to set up an exercise.[/dim]")
+        update_profile(
+            effective_data_dir(),
+            height_cm=height_cm,
+            sex=sex,
+            preferred_days_per_week=global_days,
+        )
+        api_update_bodyweight(effective_data_dir(), bodyweight_kg)
+        api_update_language(effective_data_dir(), language)
+        views.console.print()
+        views.print_success(t("profile.updated", path=effective_data_dir() / "profile.json"))
+    views.console.print(
+        "[dim]Use 'profile add-exercise <id>' to set up an exercise.[/dim]"
+    )
 
 
 def _menu_add_exercise(exercise_id: str) -> None:
-    """Interactive exercise setup helper — prompts for days, target, equipment."""
+    """Interactive exercise setup helper -- prompts for days, target, equipment."""
     try:
-        exercise = get_exercise(exercise_id)
-    except ValueError:
-        valid = ", ".join(EXERCISE_REGISTRY.keys())
+        exercise = get_exercise_info(exercise_id)
+    except (ValueError, KeyError):
+        valid = ", ".join(ex["id"] for ex in list_exercises())
         views.print_error(f"Unknown exercise '{exercise_id}'. Valid: {valid}")
         return
 
-    profile_store = get_profile_store()
-    profile = profile_store.load_profile()
-    if profile is None:
-        views.print_error(t("error.profile_not_found", path=profile_store.profile_path))
+    profile_dict = get_profile(effective_data_dir())
+    if profile_dict is None:
+        views.print_error(
+            t("error.profile_not_found", path=effective_data_dir() / "profile.json")
+        )
         views.print_info("Run 'profile init' first.")
         return
 
-    if exercise_id in profile.exercises_enabled:
+    if exercise_id in profile_dict.get("exercises_enabled", []):
         views.print_warning(f"Exercise '{exercise_id}' is already enabled.")
         raw = views.console.input("Re-configure it? [y/N] ").strip().lower()
         if raw != "y":
             return
-        # Remove then re-add
-        profile.exercises_enabled.remove(exercise_id)
-        profile.exercise_days.pop(exercise_id, None)
-        profile.exercise_targets.pop(exercise_id, None)
-        _wipe_exercise_equipment(profile_store, exercise_id)
-        _wipe_exercise_plan_start(profile_store, exercise_id)
-        exercise_store = get_store(None, exercise_id)
-        if exercise_store.history_path.exists():
-            exercise_store.history_path.unlink()
+        disable_exercise(effective_data_dir(), exercise_id)
+        _wipe_exercise_equipment(effective_data_dir(), exercise_id)
+        _wipe_exercise_plan_start(effective_data_dir(), exercise_id)
+        delete_exercise_history(effective_data_dir(), exercise_id)
 
     views.console.print()
-    views.console.print(f"[bold]Setting up {exercise.display_name}[/bold]")
+    views.console.print(f"[bold]Setting up {exercise['display_name']}[/bold]")
 
     # Days per week
-    default_days = profile.exercise_days.get(exercise_id, profile.preferred_days_per_week)
-    days = _ask_days(f"Training days/week — {exercise.display_name}", default_days)
+    default_days = profile_dict.get("exercise_days", {}).get(
+        exercise_id, profile_dict.get("preferred_days_per_week", 3)
+    )
+    days = _ask_days(f"Training days/week -- {exercise['display_name']}", default_days)
 
     # Target reps
     while True:
-        raw = views.console.input(t("profile.target_reps_prompt", exercise_name=exercise.display_name, default=20)).strip()
+        raw = views.console.input(
+            t(
+                "profile.target_reps_prompt",
+                exercise_name=exercise["display_name"],
+                default=20,
+            )
+        ).strip()
         if not raw:
             target_reps = 20
             break
@@ -764,7 +800,11 @@ def _menu_add_exercise(exercise_id: str) -> None:
     # Target weight
     while True:
         raw = views.console.input(
-            t("profile.target_weight_prompt", exercise_name=exercise.display_name, default="0.0")
+            t(
+                "profile.target_weight_prompt",
+                exercise_name=exercise["display_name"],
+                default="0.0",
+            )
         ).strip()
         if not raw:
             target_wt = 0.0
@@ -777,26 +817,29 @@ def _menu_add_exercise(exercise_id: str) -> None:
             pass
         views.print_error(t("error.positive_number"))
 
-    profile.exercises_enabled.append(exercise_id)
-    profile.exercise_days[exercise_id] = days
-    profile.exercise_targets[exercise_id] = ExerciseTarget(reps=target_reps, weight_kg=target_wt)
+    enable_exercise(effective_data_dir(), exercise_id)
+    set_exercise_target(effective_data_dir(), exercise_id, target_reps, target_wt)
+    set_exercise_days(effective_data_dir(), exercise_id, days)
 
-    bw = profile_store.load_bodyweight() or 80.0
-    profile_store.save_profile(profile, bw)
-
-    exercise_store = get_store(None, exercise_id)
-    exercise_store.init()
+    bw = profile_dict.get("current_bodyweight_kg", 80.0)
 
     today = datetime.now()
     plan_start = (today + timedelta(days=2)).strftime("%Y-%m-%d")
-    exercise_store.set_plan_start_date(plan_start)
+    set_plan_start_date(effective_data_dir(), exercise_id, plan_start)
 
     # Equipment
     views.console.print()
     views.console.print(f"[bold]{t('profile.equipment_setup_title')}[/bold]")
-    existing_eq = exercise_store.load_current_equipment(exercise_id)
-    new_eq_state = _ask_equipment(exercise_id, existing_eq)
-    exercise_store.update_equipment(new_eq_state)
+    existing_eq = get_current_equipment(effective_data_dir(), exercise_id)
+    new_eq = _ask_equipment(exercise_id, existing_eq)
+    update_equipment(
+        effective_data_dir(),
+        exercise_id,
+        active_item=new_eq["active_item"],
+        available_items=new_eq["available_items"],
+        machine_assistance_kg=new_eq.get("machine_assistance_kg"),
+        elevation_height_cm=new_eq.get("elevation_height_cm"),
+    )
 
     # Baseline
     raw = views.console.input("Baseline max reps (leave blank to skip): ").strip()
@@ -805,41 +848,45 @@ def _menu_add_exercise(exercise_id: str) -> None:
             baseline_max = int(raw)
             if baseline_max > 0:
                 today_str = today.strftime("%Y-%m-%d")
-                test_set = SetResult(
-                    target_reps=baseline_max,
-                    actual_reps=baseline_max,
-                    rest_seconds_before=180,
-                    added_weight_kg=0.0,
-                    rir_target=0,
-                    rir_reported=0,
+                api_log_session(
+                    effective_data_dir(),
+                    exercise_id,
+                    {
+                        "date": today_str,
+                        "bodyweight_kg": bw,
+                        "grip": exercise["primary_variant"],
+                        "session_type": "TEST",
+                        "exercise_id": exercise_id,
+                        "planned_sets": [{"target_reps": baseline_max}],
+                        "completed_sets": [
+                            {
+                                "actual_reps": baseline_max,
+                                "rest_seconds_before": 180,
+                                "added_weight_kg": 0.0,
+                                "rir_reported": 0,
+                            }
+                        ],
+                        "notes": "Baseline max test",
+                    },
                 )
-                session = SessionResult(
-                    date=today_str,
-                    bodyweight_kg=bw,
-                    grip=exercise.primary_variant,
-                    session_type="TEST",
-                    exercise_id=exercise_id,
-                    planned_sets=[test_set],
-                    completed_sets=[test_set],
-                    notes="Baseline max test",
-                )
-                exercise_store.append_session(session)
                 views.print_success(t("profile.logged_baseline", reps=baseline_max))
         except ValueError:
             pass
 
-    views.print_success(f"Exercise '{exercise.display_name}' set up successfully.")
+    views.print_success(f"Exercise '{exercise['display_name']}' set up successfully.")
 
 
 def _menu_update_weight() -> None:
     """Interactive bodyweight update helper called from the main menu."""
-    store = get_profile_store()
-    current_bw = store.load_bodyweight()
+    profile_dict = get_profile(effective_data_dir())
+    current_bw = profile_dict.get("current_bodyweight_kg") if profile_dict else None
     default_str = f"{current_bw:.1f}" if current_bw is not None else ""
 
     views.console.print()
     while True:
-        raw = views.console.input(t("profile.bodyweight_prompt", default=default_str)).strip()
+        raw = views.console.input(
+            t("profile.bodyweight_prompt", default=default_str)
+        ).strip()
         if not raw and current_bw is not None:
             views.print_info(t("profile.no_change"))
             return
@@ -852,7 +899,7 @@ def _menu_update_weight() -> None:
         views.print_error(t("error.positive_number"))
 
     try:
-        store.update_bodyweight(bodyweight_kg)
+        api_update_bodyweight(effective_data_dir(), bodyweight_kg)
         views.print_success(t("profile.updated_bodyweight", value=bodyweight_kg))
     except Exception as e:
         views.print_error(str(e))
@@ -867,14 +914,13 @@ def update_language_cmd(
     if lang not in langs:
         views.print_error(t("profile.language_error", options="/".join(langs)))
         raise typer.Exit(1)
-    store = get_profile_store()
-    if not store.profile_path.exists():
-        views.print_error(t("error.profile_not_found", path=store.profile_path))
+    try:
+        api_update_language(effective_data_dir(), lang)
+        views.print_success(t("profile.updated_language", lang=lang))
+    except ProfileNotFoundError as e:
+        views.print_error(str(e))
         views.print_info(t("error.run_init_profile"))
         raise typer.Exit(1)
-    try:
-        store.update_language(lang)
-        views.print_success(t("profile.updated_language", lang=lang))
     except Exception as e:
         views.print_error(str(e))
         raise typer.Exit(1)
@@ -882,17 +928,20 @@ def update_language_cmd(
 
 def _menu_update_language() -> None:
     """Interactive language update helper called from the main menu."""
-    store = get_profile_store()
-    current_profile = store.load_profile()
-    current_lang = current_profile.language if current_profile else "en"
+    profile_dict = get_profile(effective_data_dir())
+    current_lang = profile_dict.get("language", "en") if profile_dict else "en"
     langs = available_languages()
     options_str = "/".join(langs)
 
     views.console.print()
     while True:
-        raw = views.console.input(
-            t("profile.language_prompt", options=options_str, default=current_lang)
-        ).strip().lower()
+        raw = (
+            views.console.input(
+                t("profile.language_prompt", options=options_str, default=current_lang)
+            )
+            .strip()
+            .lower()
+        )
         if not raw:
             views.print_info(t("profile.no_change"))
             return
@@ -901,7 +950,7 @@ def _menu_update_language() -> None:
         views.print_error(t("profile.language_error", options=options_str))
 
     try:
-        store.update_language(raw)
+        api_update_language(effective_data_dir(), raw)
         views.print_success(t("profile.updated_language", lang=raw))
     except Exception as e:
         views.print_error(str(e))
