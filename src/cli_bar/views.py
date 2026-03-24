@@ -121,7 +121,7 @@ def _print_equipment_header(
 ) -> None:
     """Print the equipment info line (and optional BSS-degraded warning)."""
     catalog = get_equipment_catalog(exercise_id)
-    active_item = equipment_state["active_item"]
+    active_item = equipment_state.get("recommended_item") or (equipment_state.get("available_items") or [""])[0]
     item_label = catalog.get(active_item, {}).get("label", active_item)
     a_kg = get_assistance_kg(
         exercise_id, active_item, equipment_state.get("machine_assistance_kg")
@@ -218,9 +218,8 @@ def _print_band_progression(
         return
     try:
         catalog = get_equipment_catalog(exercise_id)
-        current_label = catalog.get(equipment_state["active_item"], {}).get(
-            "label", equipment_state["active_item"]
-        )
+        cur_item = equipment_state.get("recommended_item") or (equipment_state.get("available_items") or [""])[0]
+        current_label = catalog.get(cur_item, {}).get("label", cur_item)
         next_label = catalog.get(band_hint, {}).get("label", band_hint)
         console.print()
         console.print(

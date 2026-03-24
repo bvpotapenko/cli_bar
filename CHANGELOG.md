@@ -2,6 +2,14 @@
 
 All notable changes to **cli-bar** are documented here.
 
+## [0.1.1] - 2026-03-24
+
+### Changed
+
+- Updated for bar-scheduler 0.4.3 compatibility:
+  - `get_next_band_step` now passes `exercise_id` (required by new signature)
+  - BSS elevation height prompt removed from equipment setup — no longer tracked by the planner
+
 ## [0.1.0] - 2026-03-23
 
 Initial release -- CLI interface extracted from the monolithic bar-scheduler project into its own installable package.

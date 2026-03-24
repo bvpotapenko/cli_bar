@@ -1,6 +1,6 @@
 [project]
 name = "cli-bar"
-version = "0.1.0"
+version = "0.1.1"
 description = "CLI for BAR-SCHEDULER"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -29,3 +29,6 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cli_bar"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]

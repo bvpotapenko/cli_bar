@@ -244,8 +244,9 @@ def plan(
     band_hint: str | None = None
     if equipment_state:
         try:
-            if check_band_progression(effective_data_dir(), exercise_id):
-                band_hint = get_next_band_step(equipment_state["active_item"])
+            rec_item = equipment_state.get("recommended_item")
+            if rec_item and check_band_progression(effective_data_dir(), exercise_id):
+                band_hint = get_next_band_step(rec_item, exercise_id)
         except Exception:
             pass
 
