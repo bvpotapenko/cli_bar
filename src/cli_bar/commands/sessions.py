@@ -6,12 +6,13 @@ from typing import Annotated, Optional
 
 import typer
 
-from bar_scheduler.api.api import (
+from bar_scheduler.api import (
     delete_session as api_delete_session,
     get_history as api_get_history,
     log_session as api_log_session,
     get_exercise_info,
     get_training_status,
+    get_load_data,
     training_max_from_baseline,
     get_plan_cache_entry,
     get_profile,
@@ -23,6 +24,7 @@ from bar_scheduler.api.api import (
     parse_compact_sets,
     parse_sets_string,
 )
+from bar_scheduler.api.types import SessionInput, SessionType, SetInput
 from cli_bar import views
 from cli_bar.app import OVERPERFORMANCE_REP_THRESHOLD, ExerciseOption, app, effective_data_dir
 from cli_bar.i18n import t
@@ -241,18 +243,18 @@ def log_session(
 
     # Normalize CLI-provided session_type shortcuts (M→TEST, lowercase aliases)
     if session_type is not None:
-        _norm = {
-            "m": "TEST",
-            "M": "TEST",
-            "s": "S",
-            "h": "H",
-            "e": "E",
-            "t": "T",
-            "S": "S",
-            "H": "H",
-            "E": "E",
-            "T": "T",
-            "TEST": "TEST",
+        _norm: dict[str, str] = {
+            "m": SessionType.TEST,
+            "M": SessionType.TEST,
+            "s": SessionType.S,
+            "h": SessionType.H,
+            "e": SessionType.E,
+            "t": SessionType.T,
+            "S": SessionType.S,
+            "H": SessionType.H,
+            "E": SessionType.E,
+            "T": SessionType.T,
+            "TEST": SessionType.TEST,
         }
         session_type = _norm.get(session_type, session_type)
 
@@ -289,18 +291,18 @@ def log_session(
     # Session type
     if session_type is None:
         views.console.print(t("log.session_type_header"))
-        valid_types = {
-            "s": "S",
-            "h": "H",
-            "e": "E",
-            "t": "T",
-            "m": "TEST",
-            "S": "S",
-            "H": "H",
-            "E": "E",
-            "T": "T",
-            "M": "TEST",
-            "TEST": "TEST",
+        valid_types: dict[str, str] = {
+            "s": SessionType.S,
+            "h": SessionType.H,
+            "e": SessionType.E,
+            "t": SessionType.T,
+            "m": SessionType.TEST,
+            "S": SessionType.S,
+            "H": SessionType.H,
+            "E": SessionType.E,
+            "T": SessionType.T,
+            "M": SessionType.TEST,
+            "TEST": SessionType.TEST,
         }
         while True:
             raw = views.console.input(t("log.session_type_prompt")).strip() or "S"
@@ -359,7 +361,7 @@ def log_session(
         )
         raise typer.Exit(1)
 
-    if session_type not in ("S", "H", "E", "T", "TEST"):
+    if session_type not in (SessionType.S, SessionType.H, SessionType.E, SessionType.T, SessionType.TEST):
         views.print_error(t("log.session_type_must_be"))
         raise typer.Exit(1)
 
@@ -376,12 +378,12 @@ def log_session(
     # -- Build and save session ----------------------------------------------
 
     completed_sets = [
-        {
-            "actual_reps": reps,
-            "added_weight_kg": weight,
-            "rest_seconds_before": rest,
-            "rir_reported": rir_value,
-        }
+        SetInput(
+            reps=reps,
+            added_weight_kg=weight,
+            rest_seconds_before=rest,
+            rir_reported=rir_value,
+        )
         for reps, weight, rest in parsed_sets
     ]
 
@@ -407,16 +409,16 @@ def log_session(
         api_log_session(
             effective_data_dir(),
             exercise_id,
-            {
-                "date": date,
-                "bodyweight_kg": bodyweight_kg,
-                "grip": grip,
-                "session_type": session_type,
-                "exercise_id": exercise_id,
-                "completed_sets": completed_sets,
-                "planned_sets": planned_sets,
-                "notes": notes,
-            },
+            SessionInput(
+                date=date,
+                bodyweight_kg=bodyweight_kg,
+                grip=grip,
+                session_type=session_type,
+                exercise_id=exercise_id,
+                completed_sets=completed_sets,
+                planned_sets=planned_sets,
+                notes=notes,
+            ),
         )
     except ValidationError as e:
         views.print_error(f"Invalid session data: {e}")
@@ -444,7 +446,7 @@ def log_session(
     # Overperformance / personal best detection
     new_personal_best = False
     new_tm: int | None = None
-    if session_type != "TEST" and max_reps > 0:
+    if session_type != SessionType.TEST and max_reps > 0:
         try:
             train_status = get_training_status(effective_data_dir(), exercise_id)
             tm = train_status["training_max"]
@@ -454,23 +456,23 @@ def log_session(
                 api_log_session(
                     effective_data_dir(),
                     exercise_id,
-                    {
-                        "date": date,
-                        "bodyweight_kg": bodyweight_kg,
-                        "grip": exercise["primary_variant"],
-                        "session_type": "TEST",
-                        "exercise_id": exercise_id,
-                        "planned_sets": [{"target_reps": max_reps}],
-                        "completed_sets": [
-                            {
-                                "actual_reps": max_reps,
-                                "rest_seconds_before": 180,
-                                "added_weight_kg": 0.0,
-                                "rir_reported": 0,
-                            }
+                    SessionInput(
+                        date=date,
+                        bodyweight_kg=bodyweight_kg,
+                        grip=exercise["primary_variant"],
+                        session_type=SessionType.TEST,
+                        exercise_id=exercise_id,
+                        planned_sets=[{"target_reps": max_reps}],
+                        completed_sets=[
+                            SetInput(
+                                reps=max_reps,
+                                added_weight_kg=0.0,
+                                rest_seconds_before=180,
+                                rir_reported=0,
+                            )
                         ],
-                        "notes": "Auto-logged from session personal best",
-                    },
+                        notes="Auto-logged from session personal best",
+                    ),
                 )
                 new_tm = training_max_from_baseline(max_reps)
                 new_personal_best = True
@@ -599,7 +601,17 @@ def show_history(
         print(json.dumps(output, indent=2))
         return
 
-    views.print_history(sessions)
+    load_map: dict[tuple[str, str], float] | None = None
+    try:
+        load_data = get_load_data(effective_data_dir(), exercise_id)
+        load_map = {
+            (entry["date"], entry["session_type"]): entry["load"]
+            for entry in load_data.get("history", [])
+        }
+    except Exception:
+        pass
+
+    views.print_history(sessions, load_map=load_map)
 
 
 @app.command("delete-record")

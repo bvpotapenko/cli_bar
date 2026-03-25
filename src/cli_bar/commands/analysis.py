@@ -6,11 +6,12 @@ from typing import Annotated, Optional
 
 import typer
 
-from bar_scheduler.api.api import (
+from bar_scheduler.api import (
     get_training_status as api_status,
     get_volume_data,
     get_progress_data,
     get_onerepmax_data,
+    get_load_data,
     get_profile,
     get_exercise_info,
     ProfileNotFoundError,
@@ -259,6 +260,65 @@ def onerepmax(
     if onerm_explanation:
         views.console.print(f"  {onerm_explanation}")
     views.console.print()
+
+
+@app.command("load-plot")
+def load_plot(
+    weeks_ahead: Annotated[
+        int,
+        typer.Option("--weeks", "-w", help="Number of weeks ahead to project load"),
+    ] = 4,
+    json_out: Annotated[
+        bool,
+        typer.Option("--json", "-j", help="Output raw load data as JSON"),
+    ] = False,
+    exercise_id: ExerciseOption = "pull_up",
+) -> None:
+    """
+    Plot per-session training load over time (history + projected plan).
+
+    Shows how load has grown and where it's heading. If a goal is set,
+    a reference line shows how far you are from goal-level load.
+    """
+    try:
+        load_data = get_load_data(effective_data_dir(), exercise_id, weeks_ahead=weeks_ahead)
+    except (ProfileNotFoundError, HistoryNotFoundError) as e:
+        views.print_error(str(e))
+        views.print_info(t("error.run_init_first"))
+        raise typer.Exit(1)
+
+    if json_out:
+        print(json.dumps(load_data, indent=2))
+        return
+
+    exercise = get_exercise_info(exercise_id)
+
+    # Compute goal load if an exercise target is set
+    goal_load: float | None = None
+    goal_description = ""
+    try:
+        profile = get_profile(effective_data_dir())
+        if profile:
+            bw = profile.get("current_bodyweight_kg", 0.0)
+            ex_target = profile.get("exercise_targets", {}).get(exercise_id)
+            if ex_target:
+                goal_reps = ex_target.get("reps", 0)
+                goal_weight_kg = ex_target.get("weight_kg", 0.0)
+                bw_fraction = exercise.get("bw_fraction", 1.0)
+                if goal_reps > 0 and bw > 0:
+                    goal_load = (bw * bw_fraction + goal_weight_kg) * goal_reps
+                    goal_description = f"{goal_reps} reps"
+                    if goal_weight_kg > 0:
+                        goal_description += f" @ +{goal_weight_kg:.1f} kg"
+    except Exception:
+        pass
+
+    views.print_load_chart(
+        load_data,
+        exercise_name=exercise["display_name"],
+        goal_load=goal_load,
+        goal_description=goal_description,
+    )
 
 
 # ---------------------------------------------------------------------------

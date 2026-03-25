@@ -9,13 +9,14 @@ from datetime import datetime
 from rich.console import Console
 from rich.table import Table
 
-from bar_scheduler.api.api import (
+from bar_scheduler.api import (
     get_exercise_info,
     get_equipment_catalog,
     get_assistance_kg,
     compute_leff,
 )
 from cli_bar.ascii_plot import (
+    create_load_plot,
     create_max_reps_plot,
     create_weekly_volume_chart_from_dict,
 )
@@ -243,6 +244,7 @@ def print_unified_plan(
     history: list[dict] | None = None,
     bodyweight_kg: float | None = None,
     band_hint: str | None = None,
+    load_map: dict[tuple[str, str], float] | None = None,
 ) -> None:
     """
     Print the full unified timeline: status + single table.
@@ -286,6 +288,7 @@ def print_unified_plan(
         table.add_column("Grip", width=5)  # Pro/Neu/Sup/…
     table.add_column("Prescribed", width=22)
     table.add_column("Actual", width=24)
+    table.add_column("Load", justify="right", style="yellow", width=7)
     table.add_column(
         "eMax", justify="right", style="bold green", width=6
     )  # past TEST=actual  past train=fi/nz  future=plan projection
@@ -339,10 +342,13 @@ def print_unified_plan(
         else:
             row_style = None
 
+        load_val = load_map.get((entry["date"], entry.get("type", ""))) if load_map else None
+        load_str = f"{load_val:.0f}" if load_val is not None else ""
+
         row_cells = [id_str, wk_str, date_cell, type_str]
         if show_grip:
             row_cells.append(grip_str)
-        row_cells.extend([prescribed_str, actual_str, tm_str])
+        row_cells.extend([prescribed_str, actual_str, load_str, tm_str])
         table.add_row(*row_cells, style=row_style)
 
     console.print(table)
@@ -356,12 +362,13 @@ def print_unified_plan(
         _print_band_progression(exercise_id, band_hint, equipment_state)
 
 
-def format_session_table(sessions: list[dict]) -> Table:
+def format_session_table(sessions: list[dict], load_map: dict[tuple[str, str], float] | None = None) -> Table:
     """
     Create a Rich table displaying session history (API dict format).
 
     Args:
         sessions: List of session dicts from api.get_history()
+        load_map: Optional mapping of date → training load from api.get_load_data()
 
     Returns:
         Rich Table object
@@ -376,6 +383,7 @@ def format_session_table(sessions: list[dict]) -> Table:
     table.add_column("Max(BW)", justify="right", style="bold")
     table.add_column("Total reps", justify="right")
     table.add_column("Avg rest(s)", justify="right")
+    table.add_column("Load", justify="right", style="yellow", width=7)
 
     for i, session in enumerate(sessions, 1):
         sets = session.get("completed_sets") or []
@@ -384,6 +392,8 @@ def format_session_table(sessions: list[dict]) -> Table:
         max_reps = max(reps) if reps else 0
         total = sum(reps)
         avg_rest = sum(rests) / len(rests) if rests else 0
+        load_val = load_map.get((session["date"], session["session_type"])) if load_map else None
+        load_str = f"{load_val:.0f}" if load_val is not None else "-"
 
         table.add_row(
             str(i),
@@ -394,6 +404,7 @@ def format_session_table(sessions: list[dict]) -> Table:
             str(max_reps) if max_reps > 0 else "-",
             str(total),
             f"{avg_rest:.0f}" if avg_rest > 0 else "-",
+            load_str,
         )
 
     return table
@@ -443,13 +454,13 @@ def format_status_display(
     return "\n".join(lines)
 
 
-def print_history(sessions: list[dict]) -> None:
+def print_history(sessions: list[dict], load_map: dict[tuple[str, str], float] | None = None) -> None:
     """Print session history (API dict format) to console."""
     if not sessions:
         console.print("[yellow]No sessions recorded yet.[/yellow]")
         return
 
-    table = format_session_table(sessions)
+    table = format_session_table(sessions, load_map=load_map)
     console.print(table)
 
 
@@ -496,6 +507,27 @@ def print_volume_chart(volume_data: dict) -> None:
     """Print weekly volume chart from api.get_volume_data() result."""
     chart = create_weekly_volume_chart_from_dict(volume_data)
     console.print(chart)
+
+
+def print_load_chart(
+    load_data: dict,
+    exercise_name: str = "",
+    goal_load: float | None = None,
+    goal_description: str = "",
+) -> None:
+    """Print ASCII training load chart from api.get_load_data() result."""
+    chart = create_load_plot(load_data, exercise_name=exercise_name, goal_load=goal_load)
+    console.print(chart)
+    if goal_load is not None:
+        history = load_data.get("history", [])
+        current_load = history[-1]["load"] if history else None
+        if current_load is not None:
+            pct = (current_load / goal_load * 100) if goal_load > 0 else 0
+            goal_line = f"Goal load ≈ {goal_load:.0f}"
+            if goal_description:
+                goal_line += f"  ({goal_description})"
+            goal_line += f"   Current: {current_load:.0f}  ({pct:.0f}% of goal)"
+            console.print(f"[dim]{goal_line}[/dim]")
 
 
 def print_success(message: str) -> None:

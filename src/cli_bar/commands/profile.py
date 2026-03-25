@@ -7,7 +7,7 @@ from typing import Annotated, Optional
 
 import typer
 
-from bar_scheduler.api.api import (
+from bar_scheduler.api import (
     ProfileAlreadyExistsError,
     ProfileNotFoundError,
     HistoryNotFoundError,

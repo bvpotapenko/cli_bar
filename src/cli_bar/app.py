@@ -16,7 +16,7 @@ def effective_data_dir() -> Path:
     """Return the active data directory (override if --history-path was given, else default)."""
     if _data_dir_override is not None:
         return _data_dir_override
-    from bar_scheduler.api.api import get_data_dir
+    from bar_scheduler.api import get_data_dir
     return get_data_dir()
 
 

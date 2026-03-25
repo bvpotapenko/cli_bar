@@ -19,7 +19,7 @@ from .commands import (
 )
 
 app.add_typer(profile.profile_app)
-from bar_scheduler.api.api import get_exercise_info, get_profile
+from bar_scheduler.api import get_exercise_info, get_profile
 from cli_bar.i18n import available_languages, set_language, t
 
 

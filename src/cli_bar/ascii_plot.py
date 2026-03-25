@@ -320,6 +320,195 @@ def create_max_reps_plot(
     return "\n".join(lines)
 
 
+def create_load_plot(
+    load_data: dict,
+    exercise_name: str = "",
+    width: int = 60,
+    height: int = 18,
+    goal_load: float | None = None,
+) -> str:
+    """
+    Create an ASCII plot of per-session training load over time.
+
+    Args:
+        load_data: Dict from api.get_load_data() with "history" and "plan" lists,
+                   each entry having {date, session_type, load}.
+        exercise_name: Display name shown in the chart title.
+        width: Total plot width in characters.
+        height: Total plot height in lines.
+        goal_load: Optional estimated load at user's goal; drawn as a horizontal line.
+
+    Returns:
+        ASCII art string.
+    """
+    history = load_data.get("history", [])
+    plan = load_data.get("plan", [])
+
+    if not history and not plan:
+        return "No load data available yet. Log sessions to see training load."
+
+    # Parse all points: (datetime, load, is_history)
+    history_points: list[tuple[datetime, float]] = []
+    for entry in history:
+        try:
+            dt = datetime.strptime(entry["date"], "%Y-%m-%d")
+            load = float(entry["load"])
+            if load > 0:
+                history_points.append((dt, load))
+        except (KeyError, ValueError):
+            continue
+
+    plan_points: list[tuple[datetime, float]] = []
+    for entry in plan:
+        try:
+            dt = datetime.strptime(entry["date"], "%Y-%m-%d")
+            load = float(entry["load"])
+            if load > 0:
+                plan_points.append((dt, load))
+        except (KeyError, ValueError):
+            continue
+
+    all_points = history_points + plan_points
+    if not all_points:
+        return "No non-zero load entries found."
+
+    all_points.sort(key=lambda x: x[0])
+    history_points.sort(key=lambda x: x[0])
+    plan_points.sort(key=lambda x: x[0])
+
+    min_date = all_points[0][0]
+    max_date = all_points[-1][0]
+    date_range = max(1, (max_date - min_date).days)
+
+    all_loads = [v for _, v in all_points]
+    if goal_load is not None:
+        all_loads.append(goal_load)
+    y_max = max(all_loads) * 1.1
+    y_min = 0.0
+    y_range = y_max - y_min if y_max > y_min else 1.0
+
+    plot_width = width - 8   # room for left y-axis labels "12345 ┤"
+    plot_height = height - 3  # room for title, x-axis separator, x-axis labels
+
+    grid = [[" " for _ in range(plot_width)] for _ in range(plot_height)]
+
+    def _xy(dt: datetime, val: float) -> tuple[int, int] | None:
+        days = (dt - min_date).days
+        x = int((days / date_range) * (plot_width - 1)) if date_range > 0 else 0
+        y_raw = (val - y_min) / y_range
+        y = int(plot_height - 1 - y_raw * (plot_height - 1))
+        if 0 <= x < plot_width and 0 <= y < plot_height:
+            return x, y
+        return None
+
+    # Draw goal line as ─
+    if goal_load is not None and y_range > 0:
+        y_raw = (goal_load - y_min) / y_range
+        gy = int(plot_height - 1 - y_raw * (plot_height - 1))
+        if 0 <= gy < plot_height:
+            for x in range(plot_width):
+                if grid[gy][x] == " ":
+                    grid[gy][x] = "─"
+
+    # Draw plan dots (·) first so history overwrites them on overlap
+    for dt, val in plan_points:
+        pos = _xy(dt, val)
+        if pos:
+            x, y = pos
+            if grid[y][x] in (" ", "─"):
+                grid[y][x] = "·"
+
+    # Draw staircase connecting lines between consecutive history points
+    h_grid: list[tuple[int, int]] = []
+    for dt, val in history_points:
+        pos = _xy(dt, val)
+        if pos:
+            h_grid.append(pos)
+
+    for i in range(len(h_grid) - 1):
+        col1, row1 = h_grid[i]
+        col2, row2 = h_grid[i + 1]
+        n_rows = abs(row2 - row1)
+
+        if n_rows == 0:
+            for x in range(col1 + 1, col2):
+                if 0 <= x < plot_width and grid[row1][x] == " ":
+                    grid[row1][x] = "-"
+            continue
+
+        if col1 == col2:
+            for r in range(min(row1, row2) + 1, max(row1, row2)):
+                if 0 <= r < plot_height and grid[r][col1] == " ":
+                    grid[r][col1] = "│"
+            continue
+
+        row_dir = -1 if row2 < row1 else 1
+        up = row_dir == -1
+        corner_exit = "╯" if up else "╮"
+        corner_entry = "╭" if up else "╰"
+        n_segs = n_rows + 1
+
+        for step in range(n_segs):
+            row = row1 + row_dir * step
+            pivot_in = col1 + (col2 - col1) * step // n_segs
+            pivot_out = col1 + (col2 - col1) * (step + 1) // n_segs
+
+            def _p(x: int, ch: str, r: int = row) -> None:
+                if 0 <= x < plot_width and 0 <= r < plot_height and grid[r][x] == " ":
+                    grid[r][x] = ch
+
+            if step == 0:
+                for x in range(col1 + 1, pivot_out):
+                    _p(x, "-")
+                _p(pivot_out, corner_exit)
+            elif step == n_segs - 1:
+                _p(pivot_in, corner_entry)
+                for x in range(pivot_in + 1, col2):
+                    _p(x, "-")
+            else:
+                _p(pivot_in, corner_entry)
+                for x in range(pivot_in + 1, pivot_out):
+                    _p(x, "-")
+                _p(pivot_out, corner_exit)
+
+    # Draw history dots (● overwrites everything)
+    for x, y in h_grid:
+        if 0 <= x < plot_width and 0 <= y < plot_height:
+            grid[y][x] = "●"
+
+    # Build output
+    lines = []
+    title = f"Training Load ({exercise_name})" if exercise_name else "Training Load"
+    lines.append(title)
+    lines.append("-" * width)
+
+    for i, row in enumerate(grid):
+        y_val = y_max - (i / max(plot_height - 1, 1)) * y_range
+        label = f"{y_val:6.0f} ┤"
+        lines.append(label + "".join(row))
+
+    lines.append("-" * width)
+
+    # X-axis date labels
+    x_labels = "        "  # align with plot_width start
+    mid_date = min_date + (max_date - min_date) / 2
+    label_line = [" "] * plot_width
+    for x_pos, date in [(0, min_date), (plot_width // 2, mid_date), (plot_width - 8, max_date)]:
+        date_str = date.strftime("%b %d")
+        for j, c in enumerate(date_str):
+            if 0 <= x_pos + j < plot_width:
+                label_line[x_pos + j] = c
+    lines.append(x_labels + "".join(label_line))
+
+    # Legend
+    legend_parts = ["● actual", "· projected"]
+    if goal_load is not None:
+        legend_parts.append("─ goal")
+    lines.append("   ".join(legend_parts))
+
+    return "\n".join(lines)
+
+
 def create_simple_bar_chart(
     labels: list[str],
     values: list[float],

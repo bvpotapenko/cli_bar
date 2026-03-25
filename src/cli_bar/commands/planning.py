@@ -6,13 +6,14 @@ from typing import Annotated, Optional
 
 import typer
 
-from bar_scheduler.api.api import (
+from bar_scheduler.api import (
     get_plan as api_get_plan,
     explain_session as api_explain_session,
     refresh_plan as api_refresh_plan,
     log_session as api_log_session,
     get_history as api_get_history,
     get_exercise_info,
+    get_load_data,
     training_max_from_baseline,
     get_profile,
     get_current_equipment,
@@ -250,6 +251,16 @@ def plan(
         except Exception:
             pass
 
+    load_map: dict[tuple[str, str], float] | None = None
+    try:
+        load_data = get_load_data(effective_data_dir(), exercise_id, weeks_ahead=weeks_ahead)
+        load_map = {
+            (entry["date"], entry["session_type"]): entry["load"]
+            for entry in load_data.get("history", []) + load_data.get("plan", [])
+        }
+    except Exception:
+        pass
+
     views.print_unified_plan(
         sessions,
         status,
@@ -259,6 +270,7 @@ def plan(
         exercise_id=exercise_id,
         bodyweight_kg=bw,
         band_hint=band_hint,
+        load_map=load_map,
     )
 
 
