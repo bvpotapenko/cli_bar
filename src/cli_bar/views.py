@@ -265,9 +265,21 @@ def print_unified_plan(
     exercise = get_exercise_info(exercise_id)
     show_grip = exercise["has_variant_rotation"]
 
+    # Compute goal eLoad if we have enough data
+    goal_eload: float | None = None
+    if exercise_target is not None and equipment_state is not None and bodyweight_kg:
+        try:
+            active_item = equipment_state.get("recommended_item") or (equipment_state.get("available_items") or [""])[0]
+            a_kg = get_assistance_kg(exercise_id, active_item, equipment_state.get("machine_assistance_kg"))
+            goal_weight = exercise_target.get("weight_kg", 0.0)
+            leff = compute_leff(exercise["bw_fraction"], bodyweight_kg, goal_weight, a_kg)
+            goal_eload = leff * exercise_target["reps"]
+        except Exception:
+            pass
+
     # Header
     console.print()
-    console.print(format_status_display(status, exercise_target=exercise_target))
+    console.print(format_status_display(status, exercise_target=exercise_target, goal_eload=goal_eload))
     console.print()
 
     # Equipment header line
@@ -413,6 +425,7 @@ def format_session_table(sessions: list[dict], load_map: dict[tuple[str, str], f
 def format_status_display(
     status: dict,
     exercise_target: dict | None = None,
+    goal_eload: float | None = None,
 ) -> str:
     """
     Format training status dict (from api.get_training_status / api.get_plan) as text block.
@@ -420,6 +433,7 @@ def format_status_display(
     Args:
         status: Status dict with training_max, latest_test_max, trend_slope_per_week, etc.
         exercise_target: User's personal goal for this exercise
+        goal_eload: Estimated load at goal reps (Leff × goal_reps)
 
     Returns:
         Formatted string
@@ -436,6 +450,8 @@ def format_status_display(
         goal_str = f"{exercise_target['reps']} reps"
         if exercise_target.get("weight_kg", 0.0) > 0:
             goal_str += f" @ +{exercise_target['weight_kg']:.1f} kg"
+        if goal_eload is not None:
+            goal_str += f" [eLoad: {goal_eload:.0f}]"
         lines.append(t("status.my_goal", goal=goal_str))
 
     lines.extend(

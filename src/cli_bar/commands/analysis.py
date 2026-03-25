@@ -14,6 +14,9 @@ from bar_scheduler.api import (
     get_load_data,
     get_profile,
     get_exercise_info,
+    get_current_equipment,
+    get_assistance_kg,
+    compute_leff,
     ProfileNotFoundError,
     HistoryNotFoundError,
 )
@@ -53,8 +56,26 @@ def status(
         print(json.dumps(status_info, indent=2))
         return
 
+    exercise_target: dict | None = None
+    goal_eload: float | None = None
+    try:
+        profile_dict = get_profile(effective_data_dir())
+        if profile_dict:
+            exercise_target = profile_dict.get("exercise_targets", {}).get(exercise_id)
+            bw = profile_dict.get("current_bodyweight_kg", 0.0)
+            if exercise_target and bw:
+                equipment_state = get_current_equipment(effective_data_dir(), exercise_id)
+                exercise = get_exercise_info(exercise_id)
+                active_item = equipment_state.get("recommended_item") or (equipment_state.get("available_items") or [""])[0]
+                a_kg = get_assistance_kg(exercise_id, active_item, equipment_state.get("machine_assistance_kg"))
+                goal_weight = exercise_target.get("weight_kg", 0.0)
+                leff = compute_leff(exercise["bw_fraction"], bw, goal_weight, a_kg)
+                goal_eload = leff * exercise_target["reps"]
+    except Exception:
+        pass
+
     views.console.print()
-    views.console.print(views.format_status_display(status_info))
+    views.console.print(views.format_status_display(status_info, exercise_target=exercise_target, goal_eload=goal_eload))
     views.console.print()
 
 
