@@ -245,6 +245,7 @@ def print_unified_plan(
     bodyweight_kg: float | None = None,
     band_hint: str | None = None,
     load_map: dict[tuple[str, str], float] | None = None,
+    goal_eload: float | None = None,
 ) -> None:
     """
     Print the full unified timeline: status + single table.
@@ -258,24 +259,13 @@ def print_unified_plan(
         history: Full session history (for band progression check)
         exercise_id: Exercise being displayed
         bodyweight_kg: Current bodyweight (for Leff calculation in header)
+        goal_eload: Pre-computed estimated load at goal reps (shown next to My Goal)
     """
     if title is None:
         title = t("table.training_log_title")
 
     exercise = get_exercise_info(exercise_id)
     show_grip = exercise["has_variant_rotation"]
-
-    # Compute goal eLoad if we have enough data
-    goal_eload: float | None = None
-    if exercise_target is not None and equipment_state is not None and bodyweight_kg:
-        try:
-            active_item = equipment_state.get("recommended_item") or (equipment_state.get("available_items") or [""])[0]
-            a_kg = get_assistance_kg(exercise_id, active_item, equipment_state.get("machine_assistance_kg"))
-            goal_weight = exercise_target.get("weight_kg", 0.0)
-            leff = compute_leff(exercise["bw_fraction"], bodyweight_kg, goal_weight, a_kg)
-            goal_eload = leff * exercise_target["reps"]
-        except Exception:
-            pass
 
     # Header
     console.print()
@@ -451,7 +441,7 @@ def format_status_display(
         if exercise_target.get("weight_kg", 0.0) > 0:
             goal_str += f" @ +{exercise_target['weight_kg']:.1f} kg"
         if goal_eload is not None:
-            goal_str += f" [eLoad: {goal_eload:.0f}]"
+            goal_str += f" \\[eLoad: {goal_eload:.0f}]"
         lines.append(t("status.my_goal", goal=goal_str))
 
     lines.extend(

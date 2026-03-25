@@ -14,9 +14,7 @@ from bar_scheduler.api import (
     get_load_data,
     get_profile,
     get_exercise_info,
-    get_current_equipment,
-    get_assistance_kg,
-    compute_leff,
+    compute_session_load,
     ProfileNotFoundError,
     HistoryNotFoundError,
 )
@@ -62,15 +60,13 @@ def status(
         profile_dict = get_profile(effective_data_dir())
         if profile_dict:
             exercise_target = profile_dict.get("exercise_targets", {}).get(exercise_id)
-            bw = profile_dict.get("current_bodyweight_kg", 0.0)
-            if exercise_target and bw:
-                equipment_state = get_current_equipment(effective_data_dir(), exercise_id)
-                exercise = get_exercise_info(exercise_id)
-                active_item = equipment_state.get("recommended_item") or (equipment_state.get("available_items") or [""])[0]
-                a_kg = get_assistance_kg(exercise_id, active_item, equipment_state.get("machine_assistance_kg"))
-                goal_weight = exercise_target.get("weight_kg", 0.0)
-                leff = compute_leff(exercise["bw_fraction"], bw, goal_weight, a_kg)
-                goal_eload = leff * exercise_target["reps"]
+            if exercise_target:
+                goal_eload = compute_session_load(
+                    effective_data_dir(),
+                    exercise_id,
+                    exercise_target["reps"],
+                    added_weight_kg=exercise_target.get("weight_kg", 0.0),
+                )
     except Exception:
         pass
 

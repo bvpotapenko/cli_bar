@@ -2,6 +2,16 @@
 
 All notable changes to **cli-bar** are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- `status` command now shows **My Goal** (was only shown in `plan`)
+
+### Changed
+
+- **My Goal** line in `status` and `plan` now includes estimated load at the goal: e.g. `30 reps [eLoad: 60]`, making it directly comparable to the Load column in the plan table
+
 ## [0.1.1] - 2026-03-24
 
 ### Changed

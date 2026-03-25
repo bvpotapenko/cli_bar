@@ -6,7 +6,7 @@ All public operations live in a single module. Every function takes `data_dir: P
 
 ```python
 from pathlib import Path
-from bar_scheduler.api.api import (
+from bar_scheduler.api import (
     # Exceptions
     ProfileAlreadyExistsError, ProfileNotFoundError, HistoryNotFoundError,
     SessionNotFoundError, ValidationError,
@@ -27,19 +27,22 @@ from bar_scheduler.api.api import (
     set_plan_start_date, get_plan_weeks, set_plan_weeks, get_plan_cache_entry,
     # Analysis
     get_training_status, get_onerepmax_data,
-    get_volume_data, get_progress_data, get_overtraining_status,
+    get_volume_data, get_progress_data, get_overtraining_status, get_load_data,
+    compute_session_load,
     # Equipment helpers
     get_current_equipment, check_band_progression,
     compute_leff, compute_equipment_adjustment, get_assistance_kg,
-    get_next_band_step, get_band_progression, get_bss_elevation_heights,
+    get_next_band_step, get_assist_progression,
     # Utilities
     get_data_dir, training_max_from_baseline,
     # Input parsers
     parse_sets_string, parse_compact_sets,
 )
+# Input types (optional — for typed session logging)
+from bar_scheduler.api.types import SessionType, SetInput, SessionInput
 ```
 
-Everything you need is in `bar_scheduler.api.api`.
+Everything you need is in `bar_scheduler.api`.
 
 ### Multi-user pattern
 
@@ -73,16 +76,13 @@ All exceptions carry a human-readable message. Clients can display `str(exc)` di
 profile = get_profile(data_dir)   # dict | None
 exists = profile is not None
 
-# Create -- exercises is optional; add them later with enable_exercise()
+# Create bare profile -- exercises are added separately with enable_exercise()
 profile = init_profile(
     data_dir,
     height_cm=180,
-    sex="male",                   # "male" | "female"
     bodyweight_kg=82.0,
-    days_per_week=3,              # 1–5, default 3
     language="en",                # any language code; stored in profile for client use
     rest_preference="normal",     # "short" | "normal" | "long"
-    # exercises=["pull_up"],      # optional; defaults to []
 )
 # returns same dict as get_profile()
 ```
@@ -92,12 +92,9 @@ profile = init_profile(
 | Key | Type | Notes |
 |---|---|---|
 | `height_cm` | `int` | |
-| `sex` | `str` | `"male"` \| `"female"` |
-| `preferred_days_per_week` | `int` | 1–5, global fallback |
-| `exercise_days` | `dict` | `{"pull_up": 3}` -- per-exercise overrides |
+| `exercise_days` | `dict` | `{"pull_up": 3}` — per-exercise training days (1–5) |
 | `exercise_targets` | `dict` | `{"pull_up": {"reps": 25, "weight_kg": 0.0}}` |
 | `exercises_enabled` | `list` | e.g. `["pull_up", "dip"]` |
-| `max_session_duration_minutes` | `int` | default 60 |
 | `rest_preference` | `str` | `"short"` \| `"normal"` \| `"long"` |
 | `injury_notes` | `str` | free text |
 | `language` | `str` | ISO 639-1 |
@@ -112,10 +109,7 @@ profile = init_profile(
 profile = update_profile(
     data_dir,
     height_cm=182,
-    sex="female",
-    preferred_days_per_week=4,
     rest_preference="short",
-    max_session_duration_minutes=45,
     injury_notes="sore right shoulder",
 )
 # returns updated profile dict
@@ -145,15 +139,16 @@ info["session_params"]["S"]["reps_min"]   # e.g. 4
 info["onerm_explanation"]                 # str describing the 1RM formula
 
 # Add / remove
-enable_exercise(data_dir, "dip")           # idempotent; creates JSONL if missing
-disable_exercise(data_dir, "dip")          # no-op if not enabled; history file kept
-delete_exercise_history(data_dir, "dip")   # permanently delete the JSONL file
+# days_per_week (1–5) is required — sets training frequency for this exercise
+enable_exercise(data_dir, "dip", days_per_week=4)  # idempotent; creates JSONL if missing
+disable_exercise(data_dir, "dip")                  # no-op if not enabled; history file kept
+delete_exercise_history(data_dir, "dip")            # permanently delete the JSONL file
 
 # Per-exercise goal
 set_exercise_target(data_dir, "pull_up", reps=25)               # bodyweight-only goal
 set_exercise_target(data_dir, "dip", reps=15, weight_kg=20.0)   # weighted goal
 
-# Per-exercise training frequency (1–5; overrides global preferred_days_per_week)
+# Override per-exercise training frequency after enabling
 set_exercise_days(data_dir, "dip", 4)
 ```
 
@@ -171,9 +166,9 @@ catalog = get_equipment_catalog("pull_up")
 #    "MACHINE_ASSISTED": {"assistance_kg": 0}, "WEIGHT_BELT": {"assistance_kg": 0}}
 
 # Set or update equipment (closes the previous active entry, appends a new one)
+# No active_item — the planner auto-selects the right item each session
 update_equipment(
     data_dir, "pull_up",
-    active_item="BAND_MEDIUM",
     available_items=["BAR_ONLY", "BAND_MEDIUM", "WEIGHT_BELT"],
     # machine_assistance_kg=None   # required for MACHINE_ASSISTED; kg of assistance
     # elevation_height_cm=None     # required for BSS ELEVATION_SURFACE: 30 | 45 | 60
@@ -182,8 +177,10 @@ update_equipment(
 
 # Read current equipment state (None if never configured)
 eq = get_current_equipment(data_dir, "pull_up")
-# → {"exercise_id", "active_item", "available_items", "machine_assistance_kg",
+# → {"exercise_id", "recommended_item", "available_items", "machine_assistance_kg",
 #    "elevation_height_cm", "assistance_kg", "is_bss_degraded"}
+# recommended_item is auto-selected from available_items based on current TM and
+# band-progression readiness (WEIGHT_BELT when TM > threshold, else best band/bar)
 
 # Band/load computations (no data_dir -- pure math)
 leff = compute_leff(bw_fraction=1.0, bodyweight_kg=82.0,
@@ -194,9 +191,9 @@ kg   = get_assistance_kg("pull_up", "BAND_LIGHT")   # → 8.0
 
 # Band progression
 ready = check_band_progression(data_dir, "pull_up", n_sessions=2)  # bool
-next_band = get_next_band_step("BAND_MEDIUM")  # → "BAND_LIGHT"
-get_band_progression()       # → ["BAND_HEAVY", "BAND_MEDIUM", "BAND_LIGHT", "BAR_ONLY"]
-get_bss_elevation_heights()  # → [30, 45, 60]
+next_item = get_next_band_step("BAND_MEDIUM", "pull_up")  # → "BAND_LIGHT"
+get_assist_progression("pull_up")  # → ["BAND_HEAVY", "BAND_MEDIUM", "BAND_LIGHT", "BAR_ONLY"]
+get_assist_progression("bss")      # → []  (BSS has no fixed-assistance progression)
 ```
 
 Equipment history is preserved (append-only). The previous active entry gets
@@ -412,6 +409,14 @@ for pt in (progress["trajectory_g"] or []):
 
 for pt in (progress["trajectory_m"] or []):
     pt["date"], pt["projected_1rm_added_kg"]
+
+# Training load for a single hypothetical set -- use with goal reps/weight
+# to display how hard a goal session would be relative to history / plan.
+load = compute_session_load(data_dir, "dip", reps=12, added_weight_kg=25.0)
+# Optional keyword arguments (all have defaults):
+#   rir=2            -- reps in reserve (default 2, plan-session neutral effort)
+#   bodyweight_kg    -- override session bodyweight; defaults to current profile value
+#   grip             -- variant string; defaults to the exercise's primary variant
 ```
 
 ---

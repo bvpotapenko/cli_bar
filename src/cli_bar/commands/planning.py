@@ -17,6 +17,7 @@ from bar_scheduler.api import (
     training_max_from_baseline,
     get_profile,
     get_current_equipment,
+    compute_session_load,
     get_plan_weeks,
     set_plan_weeks,
     check_band_progression,
@@ -261,6 +262,18 @@ def plan(
     except Exception:
         pass
 
+    goal_eload: float | None = None
+    if exercise_target:
+        try:
+            goal_eload = compute_session_load(
+                effective_data_dir(),
+                exercise_id,
+                exercise_target["reps"],
+                added_weight_kg=exercise_target.get("weight_kg", 0.0),
+            )
+        except Exception:
+            pass
+
     views.print_unified_plan(
         sessions,
         status,
@@ -271,6 +284,7 @@ def plan(
         bodyweight_kg=bw,
         band_hint=band_hint,
         load_map=load_map,
+        goal_eload=goal_eload,
     )
 
 
