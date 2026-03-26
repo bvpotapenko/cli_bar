@@ -11,8 +11,7 @@ from bar_scheduler.api import (
     get_volume_data,
     get_progress_data,
     get_onerepmax_data,
-    get_ebr_data,
-    get_goal_progress,
+    get_goal_metrics,
     get_profile,
     get_exercise_info,
     ProfileNotFoundError,
@@ -61,12 +60,12 @@ def status(
         if profile_dict:
             exercise_target = profile_dict.get("exercise_targets", {}).get(exercise_id)
             if exercise_target:
-                goal_progress = get_goal_progress(effective_data_dir(), exercise_id)
+                goal_progress = get_goal_metrics(effective_data_dir(), exercise_id)
     except Exception:
         pass
 
     views.console.print()
-    views.console.print(views.format_status_display(status_info, exercise_target=exercise_target, goal_progress=goal_progress))
+    views.console.print(views.format_status_display(status_info, exercise_target=exercise_target, goal_metrics=goal_progress))
     views.console.print()
 
 
@@ -273,60 +272,6 @@ def onerepmax(
         views.console.print(f"  {onerm_explanation}")
     views.console.print()
 
-
-@app.command("ebr-plot")
-def ebr_plot(
-    weeks_ahead: Annotated[
-        int,
-        typer.Option("--weeks", "-w", help="Number of weeks ahead to project EBR"),
-    ] = 4,
-    json_out: Annotated[
-        bool,
-        typer.Option("--json", "-j", help="Output raw EBR data as JSON"),
-    ] = False,
-    exercise_id: ExerciseOption = "pull_up",
-) -> None:
-    """
-    Plot per-session EBR (Equivalent Bodyweight Reps) over time (history + projected plan).
-
-    Shows how session difficulty has grown and where it's heading. If a goal is set,
-    a reference line shows how far you are from goal-level EBR.
-    """
-    try:
-        ebr_data = get_ebr_data(effective_data_dir(), exercise_id, weeks_ahead=weeks_ahead)
-    except (ProfileNotFoundError, HistoryNotFoundError) as e:
-        views.print_error(str(e))
-        views.print_info(t("error.run_init_first"))
-        raise typer.Exit(1)
-
-    if json_out:
-        print(json.dumps(ebr_data, indent=2))
-        return
-
-    exercise = get_exercise_info(exercise_id)
-
-    goal_progress: dict | None = None
-    goal_description = ""
-    try:
-        profile = get_profile(effective_data_dir())
-        if profile:
-            ex_target = profile.get("exercise_targets", {}).get(exercise_id)
-            if ex_target:
-                goal_progress = get_goal_progress(effective_data_dir(), exercise_id)
-                goal_reps = ex_target.get("reps", 0)
-                goal_weight_kg = ex_target.get("weight_kg", 0.0)
-                goal_description = f"{goal_reps} reps"
-                if goal_weight_kg > 0:
-                    goal_description += f" @ +{goal_weight_kg:.1f} kg"
-    except Exception:
-        pass
-
-    views.print_ebr_chart(
-        ebr_data,
-        exercise_name=exercise["display_name"],
-        goal_progress=goal_progress,
-        goal_description=goal_description,
-    )
 
 
 # ---------------------------------------------------------------------------

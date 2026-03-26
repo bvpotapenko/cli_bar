@@ -14,7 +14,7 @@ wheels = [
 [[package]]
 name = "bar-scheduler"
 version = "0.5.1"
-source = { git = "https://github.com/bvpotapenko/bar-scheduler.git#aed6bf2e3ba20b800de3f2b3d5520294d04d09c8" }
+source = { git = "https://github.com/bvpotapenko/bar-scheduler.git#d41ec6f1c2519caf4ff712e8225d3bae1fb14df1" }
 dependencies = [
     { name = "pyyaml" },
 ]

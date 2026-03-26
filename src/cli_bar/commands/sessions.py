@@ -12,7 +12,6 @@ from bar_scheduler.api import (
     log_session as api_log_session,
     get_exercise_info,
     get_training_status,
-    get_ebr_data,
     training_max_from_baseline,
     get_plan_cache_entry,
     get_profile,
@@ -601,17 +600,7 @@ def show_history(
         print(json.dumps(output, indent=2))
         return
 
-    ebr_map: dict[tuple[str, str], float] | None = None
-    try:
-        ebr_data = get_ebr_data(effective_data_dir(), exercise_id)
-        ebr_map = {
-            (entry["date"], entry["session_type"]): entry["ebr"]
-            for entry in ebr_data.get("history", [])
-        }
-    except Exception:
-        pass
-
-    views.print_history(sessions, ebr_map=ebr_map)
+    views.print_history(sessions)
 
 
 @app.command("delete-record")

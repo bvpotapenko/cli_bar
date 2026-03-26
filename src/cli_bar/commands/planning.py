@@ -13,8 +13,7 @@ from bar_scheduler.api import (
     log_session as api_log_session,
     get_history as api_get_history,
     get_exercise_info,
-    get_ebr_data,
-    get_goal_progress,
+    get_goal_metrics,
     training_max_from_baseline,
     get_profile,
     get_current_equipment,
@@ -266,20 +265,10 @@ def plan(
         except Exception:
             pass
 
-    ebr_map: dict[tuple[str, str], float] | None = None
-    try:
-        ebr_data = get_ebr_data(effective_data_dir(), exercise_id, weeks_ahead=weeks_ahead)
-        ebr_map = {
-            (entry["date"], entry["session_type"]): entry["ebr"]
-            for entry in ebr_data.get("history", []) + ebr_data.get("plan", [])
-        }
-    except Exception:
-        pass
-
-    goal_progress: dict | None = None
+    goal_metrics: dict | None = None
     if exercise_target:
         try:
-            goal_progress = get_goal_progress(effective_data_dir(), exercise_id)
+            goal_metrics = get_goal_metrics(effective_data_dir(), exercise_id)
         except Exception:
             pass
 
@@ -292,8 +281,7 @@ def plan(
         exercise_id=exercise_id,
         bodyweight_kg=bw,
         band_hint=band_hint,
-        ebr_map=ebr_map,
-        goal_progress=goal_progress,
+        goal_metrics=goal_metrics,
     )
 
 

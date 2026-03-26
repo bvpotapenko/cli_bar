@@ -16,7 +16,6 @@ from bar_scheduler.api import (
     compute_leff,
 )
 from cli_bar.ascii_plot import (
-    create_load_plot,
     create_max_reps_plot,
     create_weekly_volume_chart_from_dict,
 )
@@ -248,8 +247,7 @@ def print_unified_plan(
     history: list[dict] | None = None,
     bodyweight_kg: float | None = None,
     band_hint: str | None = None,
-    ebr_map: dict[tuple[str, str], float] | None = None,
-    goal_progress: dict | None = None,
+    goal_metrics: dict | None = None,
 ) -> None:
     """
     Print the full unified timeline: status + single table.
@@ -263,7 +261,7 @@ def print_unified_plan(
         history: Full session history (for band progression check)
         exercise_id: Exercise being displayed
         bodyweight_kg: Current bodyweight (for Leff calculation in header)
-        goal_progress: get_goal_progress() result dict (shown next to My Goal)
+        goal_metrics: get_goal_metrics() result dict (shown next to My Goal)
     """
     if title is None:
         title = t("table.training_log_title")
@@ -273,7 +271,7 @@ def print_unified_plan(
 
     # Header
     console.print()
-    console.print(format_status_display(status, exercise_target=exercise_target, goal_progress=goal_progress))
+    console.print(format_status_display(status, exercise_target=exercise_target, goal_metrics=goal_metrics))
     console.print()
 
     # Equipment header line
@@ -294,7 +292,9 @@ def print_unified_plan(
         table.add_column("Grip", width=5)  # Pro/Neu/Sup/…
     table.add_column("Prescribed", width=22)
     table.add_column("Actual", width=24)
-    table.add_column("EBR", justify="right", style="yellow", width=7)
+    table.add_column("Vol", justify="right", style="yellow", width=7)
+    table.add_column("AvgVol", justify="right", style="yellow", width=8)
+    table.add_column("1RM", justify="right", style="yellow", width=7)
     table.add_column(
         "eMax", justify="right", style="bold green", width=6
     )  # past TEST=actual  past train=fi/nz  future=plan projection
@@ -348,13 +348,15 @@ def print_unified_plan(
         else:
             row_style = None
 
-        ebr_val = ebr_map.get((entry["date"], entry.get("type", ""))) if ebr_map else None
-        ebr_str = f"{ebr_val:.1f}" if ebr_val is not None else ""
+        sm = entry.get("session_metrics") or {}
+        vol_str = f"{sm['volume_session']:.0f}" if sm.get("volume_session") is not None else ""
+        avg_vol_str = f"{sm['avg_volume_set']:.0f}" if sm.get("avg_volume_set") is not None else ""
+        orm_str = f"{sm['estimated_1rm']:.1f}" if sm.get("estimated_1rm") is not None else ""
 
         row_cells = [id_str, wk_str, date_cell, type_str]
         if show_grip:
             row_cells.append(grip_str)
-        row_cells.extend([prescribed_str, actual_str, ebr_str, tm_str])
+        row_cells.extend([prescribed_str, actual_str, vol_str, avg_vol_str, orm_str, tm_str])
         table.add_row(*row_cells, style=row_style)
 
     console.print(table)
@@ -368,13 +370,12 @@ def print_unified_plan(
         _print_band_progression(exercise_id, band_hint, equipment_state)
 
 
-def format_session_table(sessions: list[dict], ebr_map: dict[tuple[str, str], float] | None = None) -> Table:
+def format_session_table(sessions: list[dict]) -> Table:
     """
     Create a Rich table displaying session history (API dict format).
 
     Args:
         sessions: List of session dicts from api.get_history()
-        ebr_map: Optional mapping of (date, session_type) → EBR from api.get_ebr_data()
 
     Returns:
         Rich Table object
@@ -389,7 +390,9 @@ def format_session_table(sessions: list[dict], ebr_map: dict[tuple[str, str], fl
     table.add_column("Max(BW)", justify="right", style="bold")
     table.add_column("Total reps", justify="right")
     table.add_column("Avg rest(s)", justify="right")
-    table.add_column("EBR", justify="right", style="yellow", width=7)
+    table.add_column("Vol", justify="right", style="yellow", width=7)
+    table.add_column("AvgVol", justify="right", style="yellow", width=8)
+    table.add_column("1RM", justify="right", style="yellow", width=7)
 
     for i, session in enumerate(sessions, 1):
         sets = session.get("completed_sets") or []
@@ -398,8 +401,10 @@ def format_session_table(sessions: list[dict], ebr_map: dict[tuple[str, str], fl
         max_reps = max(reps) if reps else 0
         total = sum(reps)
         avg_rest = sum(rests) / len(rests) if rests else 0
-        load_val = ebr_map.get((session["date"], session["session_type"])) if ebr_map else None
-        load_str = f"{load_val:.1f}" if load_val is not None else "-"
+        sm = session.get("session_metrics") or {}
+        vol_str = f"{sm['volume_session']:.0f}" if sm.get("volume_session") is not None else "-"
+        avg_vol_str = f"{sm['avg_volume_set']:.0f}" if sm.get("avg_volume_set") is not None else "-"
+        orm_str = f"{sm['estimated_1rm']:.1f}" if sm.get("estimated_1rm") is not None else "-"
 
         table.add_row(
             str(i),
@@ -410,7 +415,9 @@ def format_session_table(sessions: list[dict], ebr_map: dict[tuple[str, str], fl
             str(max_reps) if max_reps > 0 else "-",
             str(total),
             f"{avg_rest:.0f}" if avg_rest > 0 else "-",
-            load_str,
+            vol_str,
+            avg_vol_str,
+            orm_str,
         )
 
     return table
@@ -419,7 +426,7 @@ def format_session_table(sessions: list[dict], ebr_map: dict[tuple[str, str], fl
 def format_status_display(
     status: dict,
     exercise_target: dict | None = None,
-    goal_progress: dict | None = None,
+    goal_metrics: dict | None = None,
 ) -> str:
     """
     Format training status dict (from api.get_training_status / api.get_plan) as text block.
@@ -427,7 +434,7 @@ def format_status_display(
     Args:
         status: Status dict with training_max, latest_test_max, trend_slope_per_week, etc.
         exercise_target: User's personal goal for this exercise
-        goal_progress: get_goal_progress() result dict with goal_ebr, max_reps_at_goal, progress_pct
+        goal_metrics: get_goal_metrics() result dict with estimated_1rm, volume_set
 
     Returns:
         Formatted string
@@ -444,17 +451,12 @@ def format_status_display(
         goal_str = f"{exercise_target['reps']} reps"
         if exercise_target.get("weight_kg", 0.0) > 0:
             goal_str += f" @ +{exercise_target['weight_kg']:.1f} kg"
-        if goal_progress is not None:
-            goal_ebr = goal_progress.get("goal_ebr")
-            max_reps_now = goal_progress.get("max_reps_at_goal")
-            pct = goal_progress.get("progress_pct")
-            if goal_ebr is not None:
-                goal_str += t("status.goal_ebr_suffix", goal_ebr=goal_ebr)
-            lines.append(t("status.my_goal", goal=goal_str))
-            if max_reps_now is not None and pct is not None:
-                lines.append(t("status.goal_reach", max_reps=max_reps_now, progress_pct=pct))
-        else:
-            lines.append(t("status.my_goal", goal=goal_str))
+        if goal_metrics is not None:
+            estimated_1rm = goal_metrics.get("estimated_1rm")
+            volume_set = goal_metrics.get("volume_set")
+            if estimated_1rm is not None and volume_set is not None:
+                goal_str += t("status.goal_metrics_suffix", estimated_1rm=estimated_1rm, volume_set=volume_set)
+        lines.append(t("status.my_goal", goal=goal_str))
 
     lines.extend(
         [
@@ -472,13 +474,13 @@ def format_status_display(
     return "\n".join(lines)
 
 
-def print_history(sessions: list[dict], ebr_map: dict[tuple[str, str], float] | None = None) -> None:
+def print_history(sessions: list[dict]) -> None:
     """Print session history (API dict format) to console."""
     if not sessions:
         console.print("[yellow]No sessions recorded yet.[/yellow]")
         return
 
-    table = format_session_table(sessions, ebr_map=ebr_map)
+    table = format_session_table(sessions)
     console.print(table)
 
 
@@ -526,32 +528,6 @@ def print_volume_chart(volume_data: dict) -> None:
     chart = create_weekly_volume_chart_from_dict(volume_data)
     console.print(chart)
 
-
-def print_ebr_chart(
-    ebr_data: dict,
-    exercise_name: str = "",
-    goal_progress: dict | None = None,
-    goal_description: str = "",
-) -> None:
-    """Print ASCII EBR chart from api.get_ebr_data() result."""
-    # create_load_plot expects entries with a "load" key; remap "ebr" → "load"
-    chart_data = {
-        "history": [{"date": e["date"], "session_type": e["session_type"], "load": e["ebr"]} for e in ebr_data.get("history", [])],
-        "plan": [{"date": e["date"], "session_type": e["session_type"], "load": e["ebr"]} for e in ebr_data.get("plan", [])],
-    }
-    goal_ebr = goal_progress.get("goal_ebr") if goal_progress else None
-    chart = create_load_plot(chart_data, exercise_name=exercise_name, goal_load=goal_ebr)
-    console.print(chart)
-    if goal_ebr is not None:
-        history = ebr_data.get("history", [])
-        current_ebr = history[-1]["ebr"] if history else None
-        if current_ebr is not None:
-            pct = (current_ebr / goal_ebr * 100) if goal_ebr > 0 else 0
-            goal_line = f"Goal EBR ≈ {goal_ebr:.1f}"
-            if goal_description:
-                goal_line += f"  ({goal_description})"
-            goal_line += f"   Current: {current_ebr:.1f}  ({pct:.0f}% of goal)"
-            console.print(f"[dim]{goal_line}[/dim]")
 
 
 def print_success(message: str) -> None:
