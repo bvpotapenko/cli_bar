@@ -452,10 +452,13 @@ def format_status_display(
         if exercise_target.get("weight_kg", 0.0) > 0:
             goal_str += f" @ +{exercise_target['weight_kg']:.1f} kg"
         if goal_metrics is not None:
-            estimated_1rm = goal_metrics.get("estimated_1rm")
-            volume_set = goal_metrics.get("volume_set")
-            if estimated_1rm is not None and volume_set is not None:
-                goal_str += t("status.goal_metrics_suffix", estimated_1rm=estimated_1rm, volume_set=volume_set)
+            parts = []
+            if goal_metrics.get("estimated_1rm") is not None:
+                parts.append(f"1RM: {goal_metrics['estimated_1rm']:.1f} kg")
+            if goal_metrics.get("volume_set") is not None:
+                parts.append(f"Vol/set: {goal_metrics['volume_set']:.0f}")
+            if parts:
+                goal_str += "  [" + " · ".join(parts) + "]"
         lines.append(t("status.my_goal", goal=goal_str))
 
     lines.extend(
