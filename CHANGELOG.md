@@ -4,9 +4,28 @@ All notable changes to **cli-bar** are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`incline_db_press` (Incline Dumbbell Press)** is now a fully supported exercise (`-e incline_db_press`)
+- Equipment setup for dumbbell exercises (`incline_db_press`, `bss`) now prompts for available dumbbell weights (kg, comma-separated); stored via `available_weights_kg` so the planner snaps to discrete weights
+- Baseline setup for external-load exercises (`bw_fraction = 0`) now prompts for per-hand dumbbell weight and shows the exercise test protocol before the max-reps prompt
+- `profile add-exercise` gains `--baseline-weight` option for non-interactive baseline logging with a specific dumbbell weight
+- Prescribed plan column shows `(per hand)` label for `incline_db_press` (mirrors `(per leg)` for BSS)
+
+### Changed
+
+- `profile add-exercise` interactive flow uses the exercise's recommended `target_value` as the default target reps (e.g. 15 for `incline_db_press`) instead of a fixed 20
+- For external-load exercises, the target weight prompt shows a hint clarifying it is the per-hand dumbbell weight
+
 ### Fixed
 
 - `status` command now shows **My Goal** (was only shown in `plan`)
+- Re-configuring an already-enabled exercise (via interactive menu "Re-configure it?" or `profile add-exercise --force`) no longer deletes training history. History is now only deleted when explicitly requested via `profile remove-exercise --delete-history`.
+
+### Added
+
+- `profile update-days --exercise <id> --days <n>` — update training days per week for an exercise without touching history or equipment
+- `profile update-target --exercise <id> --reps <n> [--weight <kg>]` — update the rep/weight goal for an exercise without touching history or equipment
 
 ### Changed
 

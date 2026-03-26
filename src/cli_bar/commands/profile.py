@@ -123,19 +123,26 @@ def add_exercise(
             "--baseline-max", "-b", help="Baseline max reps (logs a TEST session)"
         ),
     ] = None,
+    baseline_weight: Annotated[
+        float,
+        typer.Option(
+            "--baseline-weight",
+            help="Per-hand dumbbell weight used for baseline test (kg). Required for incline_db_press.",
+        ),
+    ] = 0.0,
     force: Annotated[
         bool,
         typer.Option(
             "--force",
             "-f",
-            help="Re-initialise from scratch if exercise already enabled",
+            help="Re-configure days/target/equipment even if exercise already enabled. History is preserved. Use 'remove-exercise --delete-history' to fully wipe.",
         ),
     ] = False,
 ) -> None:
     """
     Add an exercise to your profile and create its history file.
 
-    Use --force to wipe and re-add an exercise that is already enabled.
+    Use --force to re-configure an exercise that is already enabled (history is preserved).
     """
     # Validate exercise_id
     try:
@@ -176,7 +183,6 @@ def add_exercise(
         disable_exercise(effective_data_dir(), exercise_id)
         _wipe_exercise_equipment(effective_data_dir(), exercise_id)
         _wipe_exercise_plan_start(effective_data_dir(), exercise_id)
-        delete_exercise_history(effective_data_dir(), exercise_id)
 
     enable_exercise(effective_data_dir(), exercise_id, days_per_week=days_per_week)
     set_exercise_target(effective_data_dir(), exercise_id, target_reps, target_weight)
@@ -199,6 +205,7 @@ def add_exercise(
         exercise_id,
         available_items=new_eq["available_items"],
         machine_assistance_kg=new_eq.get("machine_assistance_kg"),
+        available_weights_kg=new_eq.get("available_weights_kg"),
     )
 
     # Log baseline TEST session if provided
@@ -218,7 +225,7 @@ def add_exercise(
                     {
                         "actual_reps": baseline_max,
                         "rest_seconds_before": 180,
-                        "added_weight_kg": 0.0,
+                        "added_weight_kg": baseline_weight,
                         "rir_reported": 0,
                     }
                 ],
@@ -322,6 +329,59 @@ def update_weight(
         raise typer.Exit(1)
 
 
+@profile_app.command("update-days")
+def update_days(
+    exercise_id: ExerciseOption = "pull_up",
+    days: Annotated[
+        int,
+        typer.Option("--days", "-d", help="Training days per week (1–5)"),
+    ] = 3,
+) -> None:
+    """
+    Update training days per week for an exercise without touching history.
+    """
+    if days not in (1, 2, 3, 4, 5):
+        views.print_error(t("error.days_must_be"))
+        raise typer.Exit(1)
+    try:
+        set_exercise_days(effective_data_dir(), exercise_id, days)
+        views.print_success(t("profile.updated_days", exercise_id=exercise_id, days=days))
+    except (ProfileNotFoundError, ValueError) as e:
+        views.print_error(str(e))
+        raise typer.Exit(1)
+
+
+@profile_app.command("update-target")
+def update_target(
+    exercise_id: ExerciseOption = "pull_up",
+    reps: Annotated[
+        int,
+        typer.Option("--reps", "-r", help="Target max reps goal"),
+    ] = 20,
+    weight: Annotated[
+        float,
+        typer.Option("--weight", "-w", help="Target added weight kg (0 = reps only)"),
+    ] = 0.0,
+) -> None:
+    """
+    Update the rep/weight goal for an exercise without touching history.
+    """
+    if reps <= 0:
+        views.print_error(t("error.positive_integer"))
+        raise typer.Exit(1)
+    if weight < 0:
+        views.print_error(t("error.positive_number"))
+        raise typer.Exit(1)
+    try:
+        set_exercise_target(effective_data_dir(), exercise_id, reps, weight)
+        views.print_success(
+            t("profile.updated_target", exercise_id=exercise_id, reps=reps, weight=weight)
+        )
+    except (ProfileNotFoundError, ValueError) as e:
+        views.print_error(str(e))
+        raise typer.Exit(1)
+
+
 def _menu_update_equipment(exercise_id: str) -> None:
     """Interactive equipment update helper -- called from the menu and CLI command."""
     profile_dict = get_profile(effective_data_dir())
@@ -380,6 +440,7 @@ def _menu_update_equipment(exercise_id: str) -> None:
         exercise_id,
         available_items=new_eq["available_items"],
         machine_assistance_kg=new_eq.get("machine_assistance_kg"),
+        available_weights_kg=new_eq.get("available_weights_kg"),
     )
     views.print_success(t("equipment.updated", exercise_name=exercise["display_name"]))
 
@@ -503,9 +564,28 @@ def _ask_equipment(exercise_id: str, existing: dict | None = None) -> dict:
         views.console.print()
         views.print_warning(t("equipment.bss_no_elevation"))
 
+    # Dumbbell weights: prompt if DUMBBELLS selected
+    available_weights_kg: list[float] | None = None
+    if "DUMBBELLS" in available_items:
+        views.console.print()
+        views.console.print(t("equipment.db_weights_hint"))
+        while True:
+            raw = views.console.input(t("equipment.db_weights_prompt")).strip()
+            if not raw:
+                break  # skip → None means inherit previous
+            try:
+                vals = [float(x.strip()) for x in raw.split(",")]
+                if all(v > 0 for v in vals):
+                    available_weights_kg = sorted(vals)
+                    break
+            except ValueError:
+                pass
+            views.print_error(t("equipment.db_weights_error"))
+
     return {
         "available_items": available_items,
         "machine_assistance_kg": machine_assistance_kg,
+        "available_weights_kg": available_weights_kg,
     }
 
 
@@ -636,7 +716,6 @@ def _menu_add_exercise(exercise_id: str) -> None:
         disable_exercise(effective_data_dir(), exercise_id)
         _wipe_exercise_equipment(effective_data_dir(), exercise_id)
         _wipe_exercise_plan_start(effective_data_dir(), exercise_id)
-        delete_exercise_history(effective_data_dir(), exercise_id)
 
     views.console.print()
     views.console.print(f"[bold]Setting up {exercise['display_name']}[/bold]")
@@ -645,17 +724,18 @@ def _menu_add_exercise(exercise_id: str) -> None:
     default_days = profile_dict.get("exercise_days", {}).get(exercise_id, 3)
     days = _ask_days(f"Training days/week -- {exercise['display_name']}", default_days)
 
-    # Target reps
+    # Target reps (use exercise's recommended target_value as default if available)
+    default_target_reps = int(exercise.get("target_value") or 20)
     while True:
         raw = views.console.input(
             t(
                 "profile.target_reps_prompt",
                 exercise_name=exercise["display_name"],
-                default=20,
+                default=default_target_reps,
             )
         ).strip()
         if not raw:
-            target_reps = 20
+            target_reps = default_target_reps
             break
         try:
             target_reps = int(raw)
@@ -666,6 +746,8 @@ def _menu_add_exercise(exercise_id: str) -> None:
         views.print_error(t("error.positive_integer"))
 
     # Target weight
+    if exercise["bw_fraction"] == 0:
+        views.console.print(t("equipment.db_target_weight_hint"))
     while True:
         raw = views.console.input(
             t(
@@ -705,14 +787,34 @@ def _menu_add_exercise(exercise_id: str) -> None:
         exercise_id,
         available_items=new_eq["available_items"],
         machine_assistance_kg=new_eq.get("machine_assistance_kg"),
+        available_weights_kg=new_eq.get("available_weights_kg"),
     )
 
     # Baseline
+    if exercise["bw_fraction"] == 0:
+        test_protocol = exercise.get("test_protocol", "")
+        if test_protocol:
+            views.console.print()
+            views.console.print(test_protocol.strip())
     raw = views.console.input("Baseline max reps (leave blank to skip): ").strip()
     if raw:
         try:
             baseline_max = int(raw)
             if baseline_max > 0:
+                baseline_weight_kg = 0.0
+                if exercise["bw_fraction"] == 0:
+                    while True:
+                        raw_w = views.console.input(
+                            t("equipment.db_baseline_weight_prompt")
+                        ).strip()
+                        try:
+                            val = float(raw_w)
+                            if val > 0:
+                                baseline_weight_kg = val
+                                break
+                        except ValueError:
+                            pass
+                        views.print_error(t("error.positive_number"))
                 today_str = today.strftime("%Y-%m-%d")
                 api_log_session(
                     effective_data_dir(),
@@ -728,7 +830,7 @@ def _menu_add_exercise(exercise_id: str) -> None:
                             {
                                 "actual_reps": baseline_max,
                                 "rest_seconds_before": 180,
-                                "added_weight_kg": 0.0,
+                                "added_weight_kg": baseline_weight_kg,
                                 "rir_reported": 0,
                             }
                         ],

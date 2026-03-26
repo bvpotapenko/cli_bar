@@ -23,7 +23,7 @@ def effective_data_dir() -> Path:
 # Shared --exercise option type used across all commands
 ExerciseOption = Annotated[
     str,
-    typer.Option("--exercise", "-e", help="Exercise ID: pull_up (default), dip, bss"),
+    typer.Option("--exercise", "-e", help="Exercise ID: pull_up (default), dip, bss, incline_db_press"),
 ]
 
 # Shared --lang option type: optional language override

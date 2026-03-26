@@ -13,11 +13,11 @@ from bar_scheduler.api import (
     log_session as api_log_session,
     get_history as api_get_history,
     get_exercise_info,
-    get_load_data,
+    get_ebr_data,
+    get_goal_progress,
     training_max_from_baseline,
     get_profile,
     get_current_equipment,
-    compute_session_load,
     get_plan_weeks,
     set_plan_weeks,
     check_band_progression,
@@ -65,6 +65,20 @@ def _prompt_baseline(bodyweight_kg: float, exercise: dict) -> int | None:
             except ValueError:
                 views.print_error(t("plan.max_reps_error"))
 
+    added_weight_kg = 0.0
+    if exercise["bw_fraction"] == 0:
+        views.console.print(t("plan.baseline_weight_hint"))
+        while True:
+            raw_w = views.console.input(t("plan.baseline_weight_prompt")).strip()
+            try:
+                val = float(raw_w)
+                if val > 0:
+                    added_weight_kg = val
+                    break
+            except ValueError:
+                pass
+            views.print_error(t("error.positive_number"))
+
     today = datetime.now().strftime("%Y-%m-%d")
     api_log_session(
         effective_data_dir(),
@@ -80,7 +94,7 @@ def _prompt_baseline(bodyweight_kg: float, exercise: dict) -> int | None:
                 {
                     "actual_reps": max_reps,
                     "rest_seconds_before": 180,
-                    "added_weight_kg": 0.0,
+                    "added_weight_kg": added_weight_kg,
                     "rir_reported": 0,
                 }
             ],
@@ -252,25 +266,20 @@ def plan(
         except Exception:
             pass
 
-    load_map: dict[tuple[str, str], float] | None = None
+    ebr_map: dict[tuple[str, str], float] | None = None
     try:
-        load_data = get_load_data(effective_data_dir(), exercise_id, weeks_ahead=weeks_ahead)
-        load_map = {
-            (entry["date"], entry["session_type"]): entry["load"]
-            for entry in load_data.get("history", []) + load_data.get("plan", [])
+        ebr_data = get_ebr_data(effective_data_dir(), exercise_id, weeks_ahead=weeks_ahead)
+        ebr_map = {
+            (entry["date"], entry["session_type"]): entry["ebr"]
+            for entry in ebr_data.get("history", []) + ebr_data.get("plan", [])
         }
     except Exception:
         pass
 
-    goal_eload: float | None = None
+    goal_progress: dict | None = None
     if exercise_target:
         try:
-            goal_eload = compute_session_load(
-                effective_data_dir(),
-                exercise_id,
-                exercise_target["reps"],
-                added_weight_kg=exercise_target.get("weight_kg", 0.0),
-            )
+            goal_progress = get_goal_progress(effective_data_dir(), exercise_id)
         except Exception:
             pass
 
@@ -283,8 +292,8 @@ def plan(
         exercise_id=exercise_id,
         bodyweight_kg=bw,
         band_hint=band_hint,
-        load_map=load_map,
-        goal_eload=goal_eload,
+        ebr_map=ebr_map,
+        goal_progress=goal_progress,
     )
 
 
