@@ -243,17 +243,17 @@ def log_session(
     # Normalize CLI-provided session_type shortcuts (M→TEST, lowercase aliases)
     if session_type is not None:
         _norm: dict[str, str] = {
-            "m": SessionType.TEST,
-            "M": SessionType.TEST,
-            "s": SessionType.S,
-            "h": SessionType.H,
-            "e": SessionType.E,
-            "t": SessionType.T,
-            "S": SessionType.S,
-            "H": SessionType.H,
-            "E": SessionType.E,
-            "T": SessionType.T,
-            "TEST": SessionType.TEST,
+            "m": "TEST",
+            "M": "TEST",
+            "s": "S",
+            "h": "H",
+            "e": "E",
+            "t": "T",
+            "S": "S",
+            "H": "H",
+            "E": "E",
+            "T": "T",
+            "TEST": "TEST",
         }
         session_type = _norm.get(session_type, session_type)
 
@@ -291,17 +291,17 @@ def log_session(
     if session_type is None:
         views.console.print(t("log.session_type_header"))
         valid_types: dict[str, str] = {
-            "s": SessionType.S,
-            "h": SessionType.H,
-            "e": SessionType.E,
-            "t": SessionType.T,
-            "m": SessionType.TEST,
-            "S": SessionType.S,
-            "H": SessionType.H,
-            "E": SessionType.E,
-            "T": SessionType.T,
-            "M": SessionType.TEST,
-            "TEST": SessionType.TEST,
+            "s": "S",
+            "h": "H",
+            "e": "E",
+            "t": "T",
+            "m": "TEST",
+            "S": "S",
+            "H": "H",
+            "E": "E",
+            "T": "T",
+            "M": "TEST",
+            "TEST": "TEST",
         }
         while True:
             raw = views.console.input(t("log.session_type_prompt")).strip() or "S"
@@ -360,7 +360,7 @@ def log_session(
         )
         raise typer.Exit(1)
 
-    if session_type not in (SessionType.S, SessionType.H, SessionType.E, SessionType.T, SessionType.TEST):
+    if session_type not in ("S", "H", "E", "T", "TEST"):
         views.print_error(t("log.session_type_must_be"))
         raise typer.Exit(1)
 
